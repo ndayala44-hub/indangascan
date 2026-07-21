@@ -28,6 +28,11 @@ app/
 │   ├── mrz.py               ICAO 9303 TD3 MRZ parser: check digits + OCR repair
 │   ├── parser.py            Spec-driven ID field extraction, region merge, NID cross-validation
 │   ├── passport_parser.py   Passport VIZ extraction with MRZ authority/override
+│   ├── face.py              Face detection/embedding/matching (SFace prod, HOG demo)
+├── verification/
+│   ├── liveness.py          Randomized challenge liveness + passive anti-spoofing
+│   └── session.py           In-memory TTL biometric sessions (Redis-swappable)
+├── api/verify_routes.py     /verify/challenge and /verify/complete endpoints
 │   └── portrait.py          Haar-cascade face crop with layout fallback
 └── static/index.html        Responsive frontend (no build step required)
 tests/test_pipeline.py       End-to-end smoke test on a synthetic warped card photo
@@ -80,6 +85,16 @@ All via environment variables (see `.env.example`): `MAX_UPLOAD_MB`, `ALLOWED_EX
 Select the document type in the UI (or pass `doc_type=passport` to `POST /api/v1/scan` with a single `front` image of the bio-data page). The pipeline locates the page (header-to-MRZ), corrects orientation, and extracts every field: passport number, surname, given names, nationality, date of birth, sex, place of birth, dates of issue and expiry, issuing authority, place of issue, and personal number, plus the raw MRZ with per-field check-digit results.
 
 The MRZ is treated as authoritative: it is parsed per ICAO 9303 (TD3) with all five check digits computed, OCR confusions repaired positionally (O/0, I/1, filler '<' misread as K/R/C/E, line-length reconciliation), and every field it covers overrides the visual zone at verified confidence. The three visual-zone dates are disambiguated against the MRZ (the issue date is the one that is neither the checksummed birth nor expiry date). Fields the MRZ does not carry (place of birth, date of issue, issuing authority, place of issue) come from label-anchored visual-zone extraction with the standard low-confidence review flags.
+
+## Identity verification (liveness + face matching)
+
+After a successful scan that yields a document portrait, the response carries a single-use verification session token and a randomized set of liveness challenges. The UI's "Verify identity" flow opens the user's camera, guides them through each challenge with real-time pass/fail feedback. Challenges are verified server-side from short frame bursts; with MediaPipe installed (default in requirements.txt) verification uses face-mesh landmarks - eye aspect ratio for blinks, mouth geometry for smiles, signed head yaw for turns - which is deterministic and direction-aware. Without MediaPipe the system falls back to Haar-cascade heuristics, clearly labeled in responses, then captures a final frame and matches the live face against the document portrait.
+
+Face matching runs on OpenCV's production stack: YuNet detection with SFace embeddings and the published cosine threshold. The two ONNX models are fetched once by `scripts/download_models.sh` (wired into the devcontainer and Dockerfile). Without them the system runs in an explicitly labeled demo mode: liveness still works, similarity is reported as indicative, and identity is never confirmed - measured tests showed classical features cannot separate same-person from impostor pairs reliably, so demo mode refuses to render a Verified verdict rather than render a false one.
+
+Anti-spoofing scope, stated honestly: the randomized server-chosen challenge defeats printed photos, static image injections and pre-recorded video replays (which cannot respond to instructions chosen after recording); inter-frame motion checks reject identical injected stills. Real-time deepfake camera injection is out of scope for this MVP and would require attested capture or vendor-grade passive liveness models.
+
+Biometric data handling: only face embeddings (not images) are retained server-side, in memory, for a 10-minute single-use session; nothing biometric is written to disk or logged. Review retention and consent obligations under Rwanda's Data Privacy and Protection Law before persisting any verification outcome.
 
 ## Performance and accuracy design
 

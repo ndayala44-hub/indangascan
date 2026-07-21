@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.api.verify_routes import router as verify_router
 from app.config import settings
 from app.core.errors import AppError
 from app.core.logging_config import request_id_ctx, setup_logging
@@ -86,6 +87,7 @@ async def unexpected_error_handler(request: Request, exc: Exception):
 
 
 app.include_router(router)
+app.include_router(verify_router)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 

@@ -167,9 +167,79 @@ def test_synthetic_passport_page():
     print("Passport synthetic OK:", {k: f["value"] for k, f in fields.items()})
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Verification: liveness logic + session store
+# --------------------------------------------------------------------------- #
+
+def test_liveness_logic():
+    from app.verification.liveness import (
+        FrameFeatures, verify_blink, verify_smile, verify_turn_left, verify_turn_right,
+    )
+    F = lambda **kw: FrameFeatures(**{"face": (100, 100, 200, 200), **kw})
+
+    blink_seq = [F(eyes=2), F(eyes=2), F(eyes=0), F(eyes=0), F(eyes=2), F(eyes=2)]
+    assert verify_blink(blink_seq)
+    assert not verify_blink([F(eyes=2)] * 6), "eyes always open is not a blink"
+    assert not verify_blink([F(eyes=0)] * 6), "eyes never open is not a blink"
+
+    assert verify_smile([F(), F(smile=True), F(smile=True), F()])
+    assert not verify_smile([F(smile=True)] + [F()] * 5), "one frame can be a false hit"
+
+    turn_l = [F(), F(), FrameFeatures(face=None, profile_left=True),
+              FrameFeatures(face=None, profile_left=True), F()]
+    assert verify_turn_left(turn_l)
+    assert not verify_turn_right(turn_l), "left turn must not satisfy the right challenge"
+
+    drift_r = [F(face=(100, 100, 200, 200)), F(face=(160, 100, 200, 200)),
+               F(face=(230, 100, 200, 200)), FrameFeatures(face=None)]
+    assert verify_turn_right(drift_r), "rightward drift + face loss counts as a right turn"
+
+
+def test_session_store_and_offer():
+    import numpy as np
+    from app.verification.session import SessionStore
+    from app.pipeline.processor import _verification_offer
+
+    s = SessionStore()
+    emb = np.ones(8, dtype=np.float32)
+    session = s.create("national_id", emb, "fallback_hog", ["blink", "smile"])
+    assert s.get(session.token) is not None
+    assert not session.liveness_passed
+    session.completed = {"blink": True, "smile": True}
+    assert session.liveness_passed
+    s.delete(session.token)
+    assert s.get(session.token) is None
+
+    assert _verification_offer(None, "national_id") == {"available": False, "reason": "no_portrait"}
+
+def test_liveness_landmark_logic():
+    from app.verification.liveness import (
+        FrameFeatures, verify_blink, verify_smile, verify_turn_left, verify_turn_right,
+    )
+    F = lambda **kw: FrameFeatures(**{"face": (0, 0, 100, 100), **kw})
+
+    assert verify_blink([F(ear=0.30), F(ear=0.31), F(ear=0.12), F(ear=0.29), F(ear=0.30)])
+    assert not verify_blink([F(ear=0.30)] * 6)
+
+    assert verify_smile([F(mouth_ratio=0.42), F(mouth_ratio=0.42),
+                         F(mouth_ratio=0.50), F(mouth_ratio=0.51)])
+    assert not verify_smile([F(mouth_ratio=0.42)] * 5)
+
+    left = [F(yaw=0.0), F(yaw=0.10), F(yaw=0.20), F(yaw=0.22)]
+    right = [F(yaw=0.0), F(yaw=-0.12), F(yaw=-0.21), F(yaw=-0.20)]
+    assert verify_turn_left(left) and not verify_turn_right(left)
+    assert verify_turn_right(right) and not verify_turn_left(right)
+
+
+
 if __name__ == "__main__":
     test_full_pipeline()
     test_card_not_detected()
     test_mrz_parser()
     test_synthetic_passport_page()
+    test_liveness_logic()
+    test_session_store_and_offer()
+    test_liveness_landmark_logic()
     print("ALL TESTS PASSED")

@@ -1,10 +1,11 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
-opencv-python-headless>=4.9,<5
+opencv-contrib-python>=4.9,<5
 pytesseract>=0.3.10
 numpy>=1.26
 Pillow>=10.0
+mediapipe>=0.10   # landmark-based liveness engine (falls back to cascades if absent)
 
 # Optional OCR engine (set OCR_ENGINE=easyocr):
 # easyocr>=1.7

@@ -21,11 +21,36 @@ from typing import Any
 import cv2
 import numpy as np
 
-from app.pipeline import detector, enhance, mrz, ocr, orientation, parser, passport_parser, portrait, regions
+from app.pipeline import detector, enhance, face as face_module, mrz, ocr, orientation, parser, passport_parser, portrait, regions
+from app.verification import liveness
+from app.verification.session import store as session_store
 
 logger = logging.getLogger(__name__)
 
 FALLBACK_CONFIDENCE = 45.0  # run the second rendering below this mean confidence
+
+
+def _verification_offer(face_img: np.ndarray | None, document_type: str) -> dict[str, Any]:
+    """
+    If the document portrait embeds successfully, open a verification session
+    keyed by a single-use token; only the embedding is retained server-side.
+    """
+    if face_img is None:
+        return {"available": False, "reason": "no_portrait"}
+    embedded = face_module.embed_face(face_img)
+    if embedded is None:
+        # Document portraits can be too small/degraded for the face gate.
+        return {"available": False, "reason": "portrait_not_embeddable"}
+    embedding, engine = embedded
+    session = session_store.create(document_type, embedding, engine, liveness.pick_challenges())
+    return {
+        "available": True,
+        "token": session.token,
+        "challenges": [{"id": c, "instruction": liveness.CHALLENGES[c]} for c in session.challenges],
+        "engine": engine,
+        "engine_reliable": engine == "sface",
+        "expires_in_seconds": 600,
+    }
 
 
 def _b64_jpeg(image: np.ndarray, quality: int = 90) -> str:
@@ -128,6 +153,7 @@ def process_passport(page: np.ndarray) -> dict[str, Any]:
     return {
         "status": "ok",
         "document_type": "passport",
+        "verification": _verification_offer(face_img, "passport"),
         "processing_ms": round(total_ms),
         "images": {
             "front": _b64_jpeg(display),
@@ -167,6 +193,7 @@ def process_id_card(front: np.ndarray, back: np.ndarray) -> dict[str, Any]:
     return {
         "status": "ok",
         "document_type": "national_id",
+        "verification": _verification_offer(face_img, "national_id"),
         "processing_ms": round(total_ms),
         "images": {
             "front": _b64_jpeg(front_display),

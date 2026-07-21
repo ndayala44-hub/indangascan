@@ -1,6 +1,8 @@
 {
   "name": "IndangaScan",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y tesseract-ocr && pip install -r requirements.txt",
-  "forwardPorts": [8000]
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y tesseract-ocr libgl1 libglib2.0-0 && pip install -r requirements.txt && bash scripts/download_models.sh || true",
+  "forwardPorts": [
+    8000
+  ]
 }

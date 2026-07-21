@@ -120,6 +120,26 @@
   .btn-ghost{background:none;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 18px;font-size:.85rem}
   .btn-ghost:hover{border-color:var(--muted)}
 
+  .btn-verify{font-family:var(--font-display);font-weight:600;background:var(--teal);color:#04211f;border:0;border-radius:8px;padding:9px 20px;font-size:.85rem}
+  .btn-verify:hover{filter:brightness(1.1)}
+  .modal.verify{max-width:720px;margin:0 auto}
+  .verify-body{display:grid;grid-template-columns:300px 1fr;gap:22px;padding:22px}
+  @media(max-width:640px){.verify-body{grid-template-columns:1fr}}
+  .cam-wrap{position:relative;aspect-ratio:3/4;background:#0a121c;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+  .cam-wrap video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+  .cam-ring{position:absolute;inset:10%;border:2px dashed var(--muted);border-radius:50%;pointer-events:none;transition:border-color .3s}
+  .cam-ring.active{border-color:var(--sun)} .cam-ring.pass{border-color:var(--green);border-style:solid}
+  .challenge-instruction{font-family:var(--font-display);font-size:1.05rem;font-weight:600}
+  .challenge-status{margin-top:8px;font-size:.85rem;color:var(--muted);min-height:1.4em}
+  .challenge-status.fail{color:var(--amber)}
+  .challenge-steps{margin-top:16px;display:flex;flex-direction:column;gap:8px}
+  .cstep{font-size:.85rem;color:var(--muted)} .cstep.done{color:var(--green)} .cstep.now{color:var(--sun)}
+  .verify-result{margin-top:18px;border-top:1px solid var(--line);padding-top:16px;font-size:.88rem}
+  .verify-result .big{font-family:var(--font-display);font-weight:700;font-size:1.2rem}
+  .verify-result .big.ok{color:var(--green)} .verify-result .big.no{color:var(--red)} .verify-result .big.demo{color:var(--amber)}
+  .verify-result .kv{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:.78rem}
+  .verify-result .note{margin-top:10px;color:var(--muted);font-size:.78rem}
+  #btnChallengeGo{margin-top:16px}
   footer{text-align:center;color:var(--muted);font-size:.75rem;padding:28px;border-top:1px solid var(--line)}
 </style>
 </head>
@@ -221,8 +241,31 @@
       </div>
     </div>
     <div class="modal-foot">
+      <button class="btn-verify" id="btnVerify" type="button" style="display:none">Verify identity</button>
       <button class="btn-ghost" id="btnJson" type="button">Download JSON</button>
       <button class="btn-ghost" id="btnAgain" type="button">Scan another card</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="verifyDialog">
+  <div class="modal verify">
+    <div class="modal-head">
+      <div><h2>Identity verification</h2><div class="meta" id="verifyMeta"></div></div>
+      <button type="button" id="btnVerifyClose">Cancel</button>
+    </div>
+    <div class="verify-body">
+      <div class="cam-wrap">
+        <video id="cam" autoplay playsinline muted></video>
+        <div class="cam-ring" id="camRing"></div>
+      </div>
+      <div class="verify-panel">
+        <div class="challenge-instruction" id="challengeText">Allow camera access to begin</div>
+        <div class="challenge-status" id="challengeStatus"></div>
+        <div class="challenge-steps" id="challengeSteps"></div>
+        <button class="btn-verify" id="btnChallengeGo" style="display:none">I'm ready</button>
+        <div class="verify-result" id="verifyResult" style="display:none"></div>
+      </div>
     </div>
   </div>
 </dialog>
@@ -324,6 +367,7 @@
       stages.forEach(s => { s.classList.remove("active"); s.classList.add("done"); });
       lastResult = data;
       renderResults(data);
+      showVerifyButton(data);
       dialog.showModal();
     } catch (e) {
       showError("Could not reach the scanning service. Check your connection and try again.", null);
@@ -393,6 +437,146 @@
   }
 
   function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  // ---------------- Identity verification ----------------
+  const vDialog = $("#verifyDialog");
+  let verification = null, stream = null;
+
+  function showVerifyButton(d) {
+    verification = d.verification && d.verification.available ? d.verification : null;
+    $("#btnVerify").style.display = verification ? "" : "none";
+  }
+
+  $("#btnVerify").addEventListener("click", async () => {
+    dialog.close();
+    vDialog.showModal();
+    $("#verifyResult").style.display = "none";
+    $("#verifyMeta").textContent = verification.engine_reliable
+      ? "production face engine" : "demo face engine — similarity indicative only";
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640 } });
+      $("#cam").srcObject = stream;
+      startChallenges();
+    } catch (e) {
+      $("#challengeText").textContent = "Camera unavailable";
+      $("#challengeStatus").textContent = "Allow camera access in your browser and reopen verification.";
+    }
+  });
+
+  function stopCamera() {
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  }
+  $("#btnVerifyClose").addEventListener("click", () => { stopCamera(); vDialog.close(); });
+
+  function captureFrame(quality = 0.85) {
+    const video = $("#cam");
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 480;
+    canvas.height = video.videoHeight || 640;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    return new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
+  }
+
+  async function captureBurst(count = 8, intervalMs = 220) {
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      frames.push(await captureFrame());
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return frames;
+  }
+
+  function renderSteps(current) {
+    const steps = $("#challengeSteps");
+    steps.innerHTML = "";
+    verification.challenges.forEach((c, i) => {
+      const el = document.createElement("div");
+      el.className = "cstep" + (i < current ? " done" : i === current ? " now" : "");
+      el.textContent = (i < current ? "✓ " : (i + 1) + ". ") + c.instruction;
+      steps.appendChild(el);
+    });
+  }
+
+  async function startChallenges() {
+    let index = 0;
+    const runOne = async () => {
+      if (index >= verification.challenges.length) return finishVerification();
+      const c = verification.challenges[index];
+      renderSteps(index);
+      $("#challengeText").textContent = c.instruction;
+      $("#challengeStatus").textContent = "Press the button, then perform the action while we record ~2 seconds.";
+      $("#challengeStatus").classList.remove("fail");
+      const go = $("#btnChallengeGo");
+      go.style.display = "";
+      go.textContent = "I'm ready";
+      go.onclick = async () => {
+        go.style.display = "none";
+        $("#camRing").classList.add("active");
+        $("#challengeStatus").textContent = "Recording — " + c.instruction.toLowerCase() + " now…";
+        const frames = await captureBurst();
+        $("#camRing").classList.remove("active");
+        $("#challengeStatus").textContent = "Checking…";
+        const body = new FormData();
+        body.append("token", verification.token);
+        body.append("challenge", c.id);
+        frames.forEach((f, i) => body.append("frames", f, "f" + i + ".jpg"));
+        try {
+          const res = await fetch("/api/v1/verify/challenge", { method: "POST", body });
+          const data = await res.json();
+          if (res.ok && data.passed) {
+            $("#camRing").classList.add("pass");
+            $("#challengeStatus").textContent = "✓ Detected";
+            setTimeout(() => { $("#camRing").classList.remove("pass"); index++; runOne(); }, 700);
+          } else {
+            $("#challengeStatus").classList.add("fail");
+            $("#challengeStatus").textContent =
+              "Not detected (" + ((data.reason || (data.error && data.error.message)) || "try again") + "). Try again.";
+            go.style.display = ""; go.textContent = "Retry";
+          }
+        } catch (e) {
+          $("#challengeStatus").classList.add("fail");
+          $("#challengeStatus").textContent = "Network error — try again.";
+          go.style.display = ""; go.textContent = "Retry";
+        }
+      };
+    };
+    runOne();
+  }
+
+  async function finishVerification() {
+    renderSteps(verification.challenges.length);
+    $("#challengeText").textContent = "Look straight at the camera";
+    $("#challengeStatus").textContent = "Capturing your face for matching…";
+    await new Promise(r => setTimeout(r, 800));
+    const frame = await captureFrame(0.92);
+    const body = new FormData();
+    body.append("token", verification.token);
+    body.append("frame", frame, "final.jpg");
+    let data;
+    try {
+      const res = await fetch("/api/v1/verify/complete", { method: "POST", body });
+      data = await res.json();
+      if (!res.ok) throw new Error((data.error && data.error.message) || "failed");
+    } catch (e) {
+      $("#challengeStatus").classList.add("fail");
+      $("#challengeStatus").textContent = e.message;
+      return;
+    }
+    stopCamera();
+    $("#challengeText").textContent = "Verification result";
+    $("#challengeStatus").textContent = "";
+    const r = $("#verifyResult");
+    const cls = data.verified ? "ok" : (data.engine_reliable ? "no" : "demo");
+    const label = data.verified ? "VERIFIED" : (data.engine_reliable ? "VERIFICATION FAILED" : "DEMO — NOT CONFIRMED");
+    r.innerHTML = '<div class="big ' + cls + '">' + label + "</div>" +
+      '<div class="kv"><span>Facial similarity</span><span>' + data.similarity_score + " (threshold " + data.threshold + ")</span></div>" +
+      '<div class="kv"><span>Liveness</span><span>passed · confidence ' + data.liveness.confidence + "</span></div>" +
+      '<div class="kv"><span>Engine</span><span>' + data.engine + "</span></div>" +
+      '<div class="kv"><span>Timestamp</span><span>' + data.timestamp.replace("T", " ").slice(0, 19) + " UTC</span></div>" +
+      (data.note ? '<div class="note">' + esc(data.note) + "</div>" : "");
+    r.style.display = "";
+    verification = null;
+  }
 
   $("#btnClose").addEventListener("click", () => dialog.close());
   $("#btnAgain").addEventListener("click", () => {
