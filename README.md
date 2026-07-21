@@ -19,12 +19,13 @@ app/
 │   ├── logging_config.py    Structured JSON logs, rotating files, per-request IDs
 │   └── errors.py            Stable error codes mapped to friendly messages
 ├── pipeline/
-│   ├── processor.py         Orchestrator (timed stages)
+│   ├── processor.py         Orchestrator (front/back in parallel, timed stages)
 │   ├── detector.py          Card detection + perspective rectification (OpenCV)
-│   ├── orientation.py       Tesseract OSD + brute-force rotation scoring
-│   ├── enhance.py           Display and OCR enhancement pipelines
+│   ├── orientation.py       Readability-scored rotation correction
+│   ├── enhance.py           Division-normalization OCR prep + display pipeline
 │   ├── ocr.py               Engine abstraction (Tesseract default, EasyOCR optional)
-│   ├── parser.py            Spec-driven Rwandan ID field extraction + validation
+│   ├── regions.py           Calibrated per-field region OCR (single-line passes)
+│   ├── parser.py            Spec-driven field extraction, region merge, NID cross-validation
 │   └── portrait.py          Haar-cascade face crop with layout fallback
 └── static/index.html        Responsive frontend (no build step required)
 tests/test_pipeline.py       End-to-end smoke test on a synthetic warped card photo
@@ -71,6 +72,12 @@ The container runs anywhere Docker runs. Straightforward options:
 ## Configuration
 
 All via environment variables (see `.env.example`): `MAX_UPLOAD_MB`, `ALLOWED_EXTENSIONS`, `MIN_IMAGE_DIMENSION`, `OCR_ENGINE` (`tesseract` or `easyocr`), `TESSERACT_LANG`, `LOW_CONFIDENCE_THRESHOLD`, `LOG_LEVEL`, `LOG_JSON`, `CORS_ORIGINS`.
+
+## Performance and accuracy design
+
+End-to-end processing runs in roughly 3 seconds on a single CPU core for a two-sided scan. The design choices that get there: front and back process in parallel (Tesseract runs as a subprocess, so threads give real concurrency, with OMP_THREAD_LIMIT=1 preventing core oversubscription); one OCR pass per side over a division-normalized image (dividing the card by a blurred copy of itself flattens the guilloche security pattern that otherwise wrecks recognition); a CLAHE fallback rendering runs only when the primary front read is weak; and orientation is settled by scoring real-word readability at 0 versus 180 degrees with an early exit when the captured orientation already reads strongly.
+
+Accuracy comes from layering three sources per field and keeping the best: the full-page pass (label-anchored parsing), calibrated region OCR (single-line --psm 7 passes over each field's known zone on the rectified card, with digit whitelists where appropriate), and redundancy encoded in the 16-digit National ID number. The NID encodes the holder's birth year and sex, which the parser uses to cross-validate the printed fields, to repair partially degraded dates (a read of 03/12/189 with an NID year of 1989 is completed to 03/12/1989 and flagged for review), and to fall back to year-only when the printed date is unreadable. Every recovered or repaired value carries an explanatory note and a low-confidence flag so a human reviewer knows exactly what to verify.
 
 ## Extending
 

@@ -14,10 +14,15 @@ Intelligence) only requires adding another `_run_*` function here.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
 import pytesseract
+
+# Tesseract's internal OpenMP threading oversubscribes CPUs when the front
+# and back sides run concurrently; a single thread per process is faster.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 from app.config import settings
 from app.core.errors import OcrFailureError

@@ -147,6 +147,28 @@ def _norm_date(raw: str) -> str | None:
     return f"{d:02d}/{mth:02d}/{y}"
 
 
+PARTIAL_DATE_PATTERN = re.compile(r"\b(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{2,4})\b")
+
+
+def _repair_partial_date(raw: str, birth_year: str) -> str | None:
+    """
+    Recover a full date when the year digits are partially degraded (e.g.
+    '03/12/189' with the NID encoding 1989). Day and month must read
+    cleanly; the year fragment must be an in-order subsequence of the year
+    encoded in the National ID number.
+    """
+    m = PARTIAL_DATE_PATTERN.search(raw)
+    if not m:
+        return None
+    d, mth, frag = int(m.group(1)), int(m.group(2)), m.group(3)
+    if not (1 <= d <= 31 and 1 <= mth <= 12):
+        return None
+    it = iter(birth_year)
+    if all(ch in it for ch in frag):  # subsequence check
+        return f"{d:02d}/{mth:02d}/{birth_year}"
+    return None
+
+
 def _norm_sex(raw: str) -> str | None:
     t = raw.lower()
     if "gabo" in t or re.search(r"\bm\b", t):
@@ -159,15 +181,25 @@ def _norm_sex(raw: str) -> str | None:
 def _name_quality(raw: str) -> float:
     """
     The card prints the surname in capitals followed by mixed-case given
-    names ("NDAYISHIMIYE Alain"). A raw value matching that shape is almost
-    certainly the real name rather than OCR residue from the label line.
+    names ("NDAYISHIMIYE Alain"). A raw value that *starts* with that shape
+    is almost certainly the real name; one containing it after junk still
+    beats a value without it.
     """
-    return 1.0 if re.search(r"[A-Z']{3,}\s+[A-Z][a-z']{2,}", raw) else 0.0
+    if re.match(r"^[^A-Za-z]*[A-Z']{4,}\s+[A-Z][a-z']{2,}", raw):
+        return 1.0
+    if re.search(r"[A-Z']{3,}\s+[A-Z][a-z']{2,}", raw):
+        return 0.5
+    return 0.0
 
 
 def _norm_name(raw: str) -> str | None:
     cleaned = re.sub(r"[^A-Za-z'\- ]", " ", raw)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    # Drop leading OCR junk fragments (1-2 letter tokens before the surname).
+    tokens = cleaned.split()
+    while len(tokens) > 2 and len(tokens[0]) <= 2:
+        tokens = tokens[1:]
+    cleaned = " ".join(tokens)
     return cleaned.title() if len(cleaned) >= 3 else None
 
 
@@ -208,11 +240,16 @@ FIELD_SPECS: list[FieldSpec] = [
     FieldSpec(
         key="sex", label="Sex (Igitsina)", side="front",
         anchor_labels=["Igitsina / Sex", "Igitsina", "Sex"],
+        pattern=re.compile(r"\b(Gabo|Gore)\b(\s*/?\s*[MF])?", re.IGNORECASE),
         normalizer=_norm_sex, required=True,
     ),
     FieldSpec(
         key="place_of_issue", label="Place of Issue (Aho Yatangiwe)", side="front",
         anchor_labels=["Aho Yatangiwe / Place of Issue", "Aho Yatangiwe", "Place of Issue"],
+        pattern=re.compile(
+            r"\b(?:Gabo|Gore)\b\s*/?\s*[MF]?\s+[A-Z][A-Za-z]{3,}\s*/?\s*[A-Z]?[A-Za-z]*",
+            re.IGNORECASE,
+        ),
         normalizer=_norm_place,
     ),
     FieldSpec(
@@ -246,12 +283,17 @@ def _extract_field(spec: FieldSpec, ocr: OcrResult) -> ExtractedField:
             raw, confidence = hit
             raw_value = raw
             if spec.pattern:
-                # A pattern-bearing field must actually match — this rejects
-                # false anchors (e.g. the card header also says "Indangamuntu").
+                # Prefer the pattern match; false anchors (e.g. the header
+                # also says "Indangamuntu") produce raws that match nothing.
                 m = spec.pattern.search(raw)
-                value = m.group(0) if m else None
-                if value and spec.normalizer:
-                    value = spec.normalizer(value)
+                if m:
+                    value = spec.normalizer(m.group(0)) if spec.normalizer else m.group(0)
+                elif spec.normalizer:
+                    # Pattern miss but a normalizer exists: let it judge the
+                    # raw directly (e.g. a place line whose "Gabo" garbled).
+                    value = spec.normalizer(raw)
+                else:
+                    value = None
             else:
                 value = spec.normalizer(raw) if spec.normalizer else raw
 
@@ -304,7 +346,44 @@ def _best_across_variants(spec: FieldSpec, variants: list[OcrResult]) -> Extract
     return best
 
 
-def parse_card(front_ocrs: list[OcrResult], back_ocrs: list[OcrResult]) -> dict[str, Any]:
+def _merge_region_candidates(
+    fields: dict[str, ExtractedField], region_texts: dict[str, tuple[str, float]]
+) -> None:
+    """
+    Region OCR reads each field's calibrated zone with a single-line pass;
+    on real cards this is usually the cleanest read available. A region
+    candidate replaces the page-level value when it normalizes successfully
+    and ranks at least as well on (quality, confidence).
+    """
+    spec_by_key = {s.key: s for s in FIELD_SPECS}
+    for key, (raw, conf) in region_texts.items():
+        spec = spec_by_key.get(key)
+        if spec is None:
+            continue
+        if spec.pattern:
+            m = spec.pattern.search(raw)
+            value = m.group(0) if m else None
+            if value and spec.normalizer:
+                value = spec.normalizer(value)
+        else:
+            value = spec.normalizer(raw) if spec.normalizer else raw
+        if not value:
+            continue
+        current = fields[key]
+        cand_q = spec.quality(raw) if spec.quality else 0.0
+        cur_q = spec.quality(current.raw) if (spec.quality and current.value) else 0.0
+        if (not current.value) or (cand_q, conf) >= (cur_q, current.confidence):
+            fields[key] = ExtractedField(
+                key, spec.label, value, conf,
+                low_confidence=conf < settings.low_confidence_threshold, raw=raw,
+            )
+
+
+def parse_card(
+    front_ocrs: list[OcrResult],
+    back_ocrs: list[OcrResult],
+    front_regions: dict[str, tuple[str, float]] | None = None,
+) -> dict[str, Any]:
     """
     Run every field spec against the appropriate side across all OCR
     preprocessing variants, derive surname / given names, cross-validate
@@ -315,6 +394,7 @@ def parse_card(front_ocrs: list[OcrResult], back_ocrs: list[OcrResult]) -> dict[
     fields: dict[str, ExtractedField] = {
         spec.key: _best_across_variants(spec, ocrs_by_side[spec.side]) for spec in FIELD_SPECS
     }
+    _merge_region_candidates(fields, front_regions or {})
     back_ocr = max(back_ocrs, key=lambda r: r.mean_confidence)
 
     # Derived: Rwandan convention places the surname first on the Names line.
@@ -344,6 +424,18 @@ def parse_card(front_ocrs: list[OcrResult], back_ocrs: list[OcrResult]) -> dict[
     validations: list[dict[str, Any]] = []
     dob, sex = fields["date_of_birth"], fields["sex"]
     if decoded and not dob.value:
+        # Try to repair a partially-read date (degraded year digits) using
+        # the birth year encoded in the NID, before falling back to year-only.
+        for source in ([front_regions.get("date_of_birth", ("", 0.0))[0]] if front_regions else []) + [dob.raw]:
+            repaired = _repair_partial_date(source, decoded["birth_year"]) if source else None
+            if repaired:
+                dob.value = repaired
+                dob.confidence = max(dob.confidence, nid.confidence)
+                dob.low_confidence = True
+                dob.notes = "Year digits were degraded; completed from the National ID number. Verify manually."
+                validations.append({"check": "birth_year_matches_id_number", "passed": True})
+                break
+    if decoded and not dob.value:
         # The printed date is unreadable, but the NID encodes the birth year.
         dob.value = f"{decoded['birth_year']} (year only)"
         dob.confidence = nid.confidence
@@ -355,12 +447,22 @@ def parse_card(front_ocrs: list[OcrResult], back_ocrs: list[OcrResult]) -> dict[
         if not ok:
             dob.low_confidence = True
             dob.notes = f"Year disagrees with ID number (encodes {decoded['birth_year']}). Review."
-    if decoded and sex.value:
+    if decoded and not sex.value:
+        sex.value = f"{decoded['sex_digit']} (from ID number)"
+        sex.confidence = nid.confidence
+        sex.low_confidence = True
+        sex.notes = "Printed value unreadable; derived from the National ID number's gender digit. Verify manually."
+    elif decoded and sex.value:
         ok = decoded["sex_digit"].lower() in sex.value.lower()
         validations.append({"check": "sex_matches_id_number", "passed": ok})
         if not ok:
             sex.low_confidence = True
             sex.notes = f"Disagrees with ID number (encodes {decoded['sex_digit']}). Review."
+
+    # De-duplicate validation entries (the date-repair path and the standard
+    # cross-check can both record the birth-year validation).
+    seen: set[str] = set()
+    validations = [v for v in validations if not (v["check"] in seen or seen.add(v["check"]))]
 
     missing_required = [
         s.label for s in FIELD_SPECS if s.required and not fields[s.key].value
