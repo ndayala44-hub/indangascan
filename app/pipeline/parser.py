@@ -175,6 +175,12 @@ def _norm_sex(raw: str) -> str | None:
         return "Male (Gabo / M)"
     if "gore" in t or re.search(r"\bf\b", t):
         return "Female (Gore / F)"
+    # Fuzzy: OCR often garbles the printed word (Gabe, Gaho, Gcre, ...).
+    for token in re.findall(r"[a-z]{3,6}", t):
+        if SequenceMatcher(None, token, "gabo").ratio() >= 0.75:
+            return "Male (Gabo / M)"
+        if SequenceMatcher(None, token, "gore").ratio() >= 0.75:
+            return "Female (Gore / F)"
     return None
 
 
@@ -289,7 +295,9 @@ def _norm_place(raw: str) -> str | None:
                             tokens[j] = sector
                         break
                 break
-    return " / ".join(tokens) if district and len(tokens) == 2 else " ".join(tokens)
+    if district is None:
+        return None  # no recognizable district => not a genuine place value
+    return " / ".join(tokens) if len(tokens) == 2 else " ".join(tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +436,42 @@ def _best_across_variants(spec: FieldSpec, variants: list[OcrResult]) -> Extract
     return best
 
 
+def _gazetteer_sweep(
+    front_ocrs: list[OcrResult], front_regions: dict[str, tuple[str, float]] | None
+) -> tuple[str, float] | None:
+    """
+    Last-resort place-of-issue finder. The value must contain one of Rwanda's
+    30 districts, so scan every token OCR'd anywhere on the front (all page
+    variants and all region crops) for a district-like word, then take the
+    following word as the sector (gazetteer-corrected where possible). This
+    needs no labels, anchors or line structure at all.
+    """
+    sources: list[tuple[str, float]] = []
+    for ocr in front_ocrs:
+        sources.extend((line.text, line.confidence) for line in ocr.lines)
+    sources.extend((raw, conf) for raw, conf in (front_regions or {}).values())
+
+    best: tuple[float, str, float] | None = None  # (match_ratio, value, ocr_conf)
+    for text, conf in sources:
+        tokens = re.sub(r"[^A-Za-z ]", " ", text).split()
+        for i, token in enumerate(tokens):
+            if len(token) < 4 or token.lower() in _CARD_LABEL_VOCAB:
+                continue
+            for district in RWANDA_DISTRICTS:
+                ratio = SequenceMatcher(None, token.lower(), district.lower()).ratio()
+                if ratio < 0.72:
+                    continue
+                sector = None
+                for nxt in tokens[i + 1:i + 3]:
+                    if len(nxt) >= 4 and nxt.lower() not in _CARD_LABEL_VOCAB:
+                        sector = _sector_match(nxt, district) or nxt.title()
+                        break
+                value = f"{district} / {sector}" if sector else district
+                if best is None or ratio > best[0]:
+                    best = (ratio, value, conf)
+    return (best[1], best[2]) if best else None
+
+
 def _merge_region_candidates(
     fields: dict[str, ExtractedField], region_texts: dict[str, tuple[str, float]]
 ) -> None:
@@ -447,6 +491,13 @@ def _merge_region_candidates(
             value = m.group(0) if m else None
             if value and spec.normalizer:
                 value = spec.normalizer(value)
+            elif value is None and spec.normalizer:
+                # Pattern miss: let the normalizer judge the raw text. Where a
+                # quality validator exists (e.g. the place gazetteer) it must
+                # also vouch for the value.
+                cand = spec.normalizer(raw)
+                if cand and (spec.quality is None or spec.quality(raw) > 0.5):
+                    value = cand
         else:
             value = spec.normalizer(raw) if spec.normalizer else raw
         if not value:
@@ -477,6 +528,19 @@ def parse_card(
         spec.key: _best_across_variants(spec, ocrs_by_side[spec.side]) for spec in FIELD_SPECS
     }
     _merge_region_candidates(fields, front_regions or {})
+
+    # Place of issue: if every structured path failed, sweep all front text
+    # for anything resembling a district.
+    place = fields["place_of_issue"]
+    if not place.value:
+        hit = _gazetteer_sweep(front_ocrs, front_regions)
+        if hit:
+            value, conf = hit
+            fields["place_of_issue"] = ExtractedField(
+                "place_of_issue", place.label, value, conf, low_confidence=True, raw=value,
+                notes="Recovered from a noisy read via the official district gazetteer. Verify manually.",
+            )
+
     back_ocr = max(back_ocrs, key=lambda r: r.mean_confidence)
 
     # Derived: Rwandan convention places the surname first on the Names line.
