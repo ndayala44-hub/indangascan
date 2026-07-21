@@ -203,11 +203,93 @@ def _norm_name(raw: str) -> str | None:
     return cleaned.title() if len(cleaned) >= 3 else None
 
 
+# The 30 districts of Rwanda - place of issue is printed as District / Sector.
+RWANDA_DISTRICTS = [
+    "Nyarugenge", "Gasabo", "Kicukiro",
+    "Nyanza", "Gisagara", "Nyaruguru", "Huye", "Nyamagabe", "Ruhango",
+    "Muhanga", "Kamonyi",
+    "Karongi", "Rutsiro", "Rubavu", "Nyabihu", "Ngororero", "Rusizi", "Nyamasheke",
+    "Rulindo", "Gakenke", "Musanze", "Burera", "Gicumbi",
+    "Rwamagana", "Nyagatare", "Gatsibo", "Kayonza", "Kirehe", "Ngoma", "Bugesera",
+]
+
+# Words printed as labels/headers on the card - a "place" made of these is
+# a mis-anchored label line, not a real value.
+_CARD_LABEL_VOCAB = {
+    "repubulika", "rwanda", "republic", "indangamuntu", "national", "identity",
+    "card", "amazina", "names", "itariki", "yavutseho", "date", "birth",
+    "igitsina", "sex", "aho", "yatangiwe", "place", "issue", "umukono",
+    "nyirayo", "signature", "nabonal", "natonal",
+}
+
+
+# Sectors per district for spell-correction. Kigali City is covered; extend
+# with further districts as verified lists are added.
+DISTRICT_SECTORS: dict[str, list[str]] = {
+    "Nyarugenge": ["Gitega", "Kanyinya", "Kigali", "Kimisagara", "Mageragere",
+                   "Muhima", "Nyakabanda", "Nyamirambo", "Nyarugenge", "Rwezamenyo"],
+    "Gasabo": ["Bumbogo", "Gatsata", "Gikomero", "Gisozi", "Jabana", "Jali",
+               "Kacyiru", "Kimihurura", "Kimironko", "Kinyinya", "Ndera",
+               "Nduba", "Remera", "Rusororo", "Rutunga"],
+    "Kicukiro": ["Gahanga", "Gatenga", "Gikondo", "Kagarama", "Kanombe",
+                 "Kicukiro", "Kigarama", "Masaka", "Niboye", "Nyarugunga"],
+}
+
+
+def _sector_match(token: str, district: str) -> str | None:
+    best, best_score = None, 0.0
+    for sector in DISTRICT_SECTORS.get(district, []):
+        score = SequenceMatcher(None, token.lower(), sector.lower()).ratio()
+        if score > best_score:
+            best, best_score = sector, score
+    return best if best_score >= 0.75 else None
+
+
+def _district_match(token: str) -> str | None:
+    """Fuzzy-match a token against the official district list (OCR-tolerant)."""
+    best, best_score = None, 0.0
+    for district in RWANDA_DISTRICTS:
+        score = SequenceMatcher(None, token.lower(), district.lower()).ratio()
+        if score > best_score:
+            best, best_score = district, score
+    return best if best_score >= 0.72 else None
+
+
+def _place_quality(raw: str) -> float:
+    tokens = re.sub(r"[^A-Za-z ]", " ", raw).split()
+    if any(t.lower() in _CARD_LABEL_VOCAB for t in tokens):
+        return 0.0
+    return 1.0 if any(_district_match(t) for t in tokens if len(t) >= 4) else 0.3
+
+
 def _norm_place(raw: str) -> str | None:
     # Sex and Place of Issue share a line on the card ("Gabo / M  Kicukiro /
     # Niboye"); drop the sex fragment before cleaning.
     t = re.sub(r".*?\b(gabo|gore)\b\s*/?\s*[MF]?\b", "", raw, flags=re.IGNORECASE)
-    return _norm_name(t if t.strip() else raw)
+    cleaned = _norm_name(t if t.strip() else raw)
+    if not cleaned:
+        return None
+    tokens = cleaned.split()
+    # Reject mis-anchored label lines masquerading as a place value.
+    if sum(t.lower() in _CARD_LABEL_VOCAB for t in tokens) >= 1:
+        return None
+    # Spell-correct District / Sector against the official gazetteer.
+    district = None
+    for i, token in enumerate(tokens):
+        if len(token) >= 4:
+            match = _district_match(token)
+            if match:
+                tokens[i] = match
+                district = match
+                # The sector follows the district on the card.
+                for j in range(i + 1, len(tokens)):
+                    if len(tokens[j]) >= 4:
+                        sector = _sector_match(tokens[j], district)
+                        if sector:
+                            tokens[j] = sector
+                        break
+                break
+    return " / ".join(tokens) if district and len(tokens) == 2 else " ".join(tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -250,7 +332,7 @@ FIELD_SPECS: list[FieldSpec] = [
             r"\b(?:Gabo|Gore)\b\s*/?\s*[MF]?\s+[A-Z][A-Za-z]{3,}\s*/?\s*[A-Z]?[A-Za-z]*",
             re.IGNORECASE,
         ),
-        normalizer=_norm_place,
+        normalizer=_norm_place, quality=_place_quality,
     ),
     FieldSpec(
         key="national_id_number", label="National ID Number (Indangamuntu)", side="front",
