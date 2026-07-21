@@ -1,0 +1,10 @@
+services:
+  indangascan:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/srv/logs
+    restart: unless-stopped

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IndangaScan — Rwandan National ID Reader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --ink:#0c1622; --panel:#14212f; --panel-2:#182838; --line:#26384a;
+    --teal:#2e9e9b; --sun:#f3c53d; --green:#1ea05a; --red:#e0604f; --amber:#e2a13a;
+    --text:#e9f0f6; --muted:#8aa0b4;
+    --font-display:"Sora",system-ui,sans-serif;
+    --font-body:"Inter",system-ui,sans-serif;
+    --font-mono:"IBM Plex Mono","SF Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--ink);color:var(--text);font-family:var(--font-body);font-size:15px;line-height:1.55;min-height:100vh}
+  button{font:inherit;cursor:pointer}
+  :focus-visible{outline:2px solid var(--sun);outline-offset:2px;border-radius:4px}
+
+  header{display:flex;align-items:center;justify-content:space-between;padding:20px clamp(16px,5vw,56px);border-bottom:1px solid var(--line)}
+  .wordmark{font-family:var(--font-display);font-weight:700;font-size:1.15rem;letter-spacing:.02em}
+  .wordmark span{color:var(--sun)}
+  .env-tag{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+
+  main{max-width:1060px;margin:0 auto;padding:clamp(28px,5vw,52px) clamp(16px,5vw,40px) 80px}
+  .lede h1{font-family:var(--font-display);font-weight:600;font-size:clamp(1.5rem,3.4vw,2.2rem);letter-spacing:-.01em}
+  .lede p{color:var(--muted);max-width:56ch;margin-top:10px}
+
+  /* ---- Viewfinder drop zones (signature element) ---- */
+  .capture{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:34px}
+  @media(max-width:720px){.capture{grid-template-columns:1fr}}
+  .zone{position:relative;aspect-ratio:856/540;background:var(--panel);border-radius:14px;border:1px solid var(--line);overflow:hidden;cursor:pointer;transition:border-color .2s}
+  .zone:hover,.zone.dragover{border-color:var(--teal)}
+  .zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
+  .zone .frame{position:absolute;inset:14px;pointer-events:none}
+  .zone .frame i{position:absolute;width:26px;height:26px;border:0 solid var(--sun);opacity:.9}
+  .zone .frame i:nth-child(1){top:0;left:0;border-top-width:3px;border-left-width:3px;border-top-left-radius:8px}
+  .zone .frame i:nth-child(2){top:0;right:0;border-top-width:3px;border-right-width:3px;border-top-right-radius:8px}
+  .zone .frame i:nth-child(3){bottom:0;left:0;border-bottom-width:3px;border-left-width:3px;border-bottom-left-radius:8px}
+  .zone .frame i:nth-child(4){bottom:0;right:0;border-bottom-width:3px;border-right-width:3px;border-bottom-right-radius:8px}
+  .zone .hint{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;padding:20px;pointer-events:none}
+  .zone .hint .side{font-family:var(--font-display);font-weight:600;font-size:1rem}
+  .zone .hint .sub{color:var(--muted);font-size:.82rem;max-width:30ch}
+  .zone img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#0a121c;display:none}
+  .zone.filled img{display:block}
+  .zone.filled .hint{display:none}
+  .zone .beam{position:absolute;left:0;right:0;top:-8%;height:8%;background:linear-gradient(180deg,transparent,rgba(243,197,61,.55),transparent);display:none;pointer-events:none}
+  .zone.scanning .beam{display:block;animation:sweep 1.6s ease-in-out infinite}
+  @keyframes sweep{0%{top:-8%}50%{top:100%}100%{top:-8%}}
+  @media(prefers-reduced-motion:reduce){.zone.scanning .beam{animation:none;display:none}}
+  .zone .clear{position:absolute;top:10px;right:10px;z-index:2;display:none;background:rgba(12,22,34,.85);border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:4px 10px;font-size:.75rem}
+  .zone.filled .clear{display:block}
+  .zone .clear:hover{color:var(--text);border-color:var(--muted)}
+
+  .actions{display:flex;align-items:center;gap:18px;margin-top:26px;flex-wrap:wrap}
+  .btn-scan{font-family:var(--font-display);font-weight:600;background:var(--sun);color:#141001;border:0;border-radius:10px;padding:13px 34px;font-size:.95rem;letter-spacing:.01em;transition:transform .12s,opacity .2s}
+  .btn-scan:hover:enabled{transform:translateY(-1px)}
+  .btn-scan:disabled{opacity:.35;cursor:not-allowed}
+  .formats{color:var(--muted);font-size:.8rem}
+
+  /* ---- Pipeline stage strip: doubles as live progress ---- */
+  .stages{display:flex;gap:0;margin-top:40px;border:1px solid var(--line);border-radius:12px;overflow:hidden;flex-wrap:wrap}
+  .stage{flex:1 1 110px;padding:12px 8px;text-align:center;background:var(--panel);border-right:1px solid var(--line);min-width:96px}
+  .stage:last-child{border-right:0}
+  .stage .n{font-family:var(--font-mono);font-size:.68rem;color:var(--muted);display:block}
+  .stage .l{font-size:.8rem;font-weight:500}
+  .stage.active{background:var(--panel-2)}
+  .stage.active .l{color:var(--sun)}
+  .stage.done .l{color:var(--teal)}
+
+  .banner{display:none;margin-top:22px;border:1px solid var(--red);background:rgba(224,96,79,.08);border-radius:10px;padding:14px 18px;font-size:.9rem}
+  .banner.show{display:block}
+  .banner .rid{font-family:var(--font-mono);color:var(--muted);font-size:.75rem;display:block;margin-top:6px}
+
+  /* ---- Results modal ---- */
+  dialog{border:0;padding:0;background:transparent;max-width:min(1040px,94vw);width:100%}
+  dialog::backdrop{background:rgba(4,9,15,.78);backdrop-filter:blur(3px)}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:16px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 24px;border-bottom:1px solid var(--line)}
+  .modal-head h2{font-family:var(--font-display);font-size:1.05rem;font-weight:600}
+  .modal-head .meta{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);margin-top:2px}
+  .modal-head button{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 12px;font-size:.8rem}
+  .modal-body{display:grid;grid-template-columns:1fr 1.15fr;gap:0;overflow:auto}
+  @media(max-width:820px){.modal-body{grid-template-columns:1fr}}
+  .panel-l{padding:22px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:16px}
+  @media(max-width:820px){.panel-l{border-right:0;border-bottom:1px solid var(--line)}}
+  .panel-l h3,.panel-r h3{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:600;margin-bottom:8px}
+  .panel-l img.cardimg{width:100%;border-radius:10px;border:1px solid var(--line);background:#0a121c}
+  .portrait-row{display:flex;gap:14px;align-items:flex-start}
+  .portrait-row img{width:110px;border-radius:10px;border:1px solid var(--line)}
+  .portrait-row .note{color:var(--muted);font-size:.8rem}
+  .panel-r{padding:22px}
+  .field{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:11px 0;border-bottom:1px solid var(--line)}
+  .field:last-of-type{border-bottom:0}
+  .field .k{color:var(--muted);font-size:.8rem;flex:0 0 44%}
+  .field .v{font-family:var(--font-mono);font-size:.88rem;text-align:right;overflow-wrap:anywhere}
+  .field .v .conf{display:block;font-size:.68rem;color:var(--muted);margin-top:2px}
+  .field.low .v{color:var(--amber)}
+  .field.low .v .conf::after{content:" · review";color:var(--amber)}
+  .field .v.missing{color:var(--muted);font-style:italic;font-family:var(--font-body)}
+  .field .note{display:block;font-size:.7rem;color:var(--amber);margin-top:3px;text-align:right}
+  .checks{margin-top:16px;display:flex;flex-direction:column;gap:6px}
+  .check{font-size:.8rem;font-family:var(--font-mono)}
+  .check.pass{color:var(--green)} .check.fail{color:var(--red)}
+  details{margin-top:18px}
+  summary{cursor:pointer;color:var(--muted);font-size:.82rem}
+  details pre{font-family:var(--font-mono);font-size:.75rem;color:var(--muted);white-space:pre-wrap;margin-top:8px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:12px}
+  .modal-foot{display:flex;justify-content:flex-end;gap:12px;padding:14px 24px;border-top:1px solid var(--line)}
+  .btn-ghost{background:none;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 18px;font-size:.85rem}
+  .btn-ghost:hover{border-color:var(--muted)}
+
+  footer{text-align:center;color:var(--muted);font-size:.75rem;padding:28px;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">Indanga<span>Scan</span></div>
+  <div class="env-tag" id="engineTag">checking engine…</div>
+</header>
+
+<main>
+  <section class="lede">
+    <h1>Read a Rwandan National ID in one pass</h1>
+    <p>Upload the front and back of the card. IndangaScan finds the card, straightens it,
+       fixes the orientation, cleans the image and extracts every field with a confidence
+       score you can verify against the original.</p>
+  </section>
+
+  <section class="capture" aria-label="Card upload">
+    <div class="zone" id="zone-front">
+      <input type="file" id="file-front" accept=".jpg,.jpeg,.png,.webp" aria-label="Upload front of ID card" />
+      <div class="frame"><i></i><i></i><i></i><i></i></div>
+      <img alt="Front of ID preview" />
+      <div class="beam"></div>
+      <div class="hint">
+        <div class="side">Front of card</div>
+        <div class="sub">Drop an image here or tap to choose. Any angle or rotation is fine.</div>
+      </div>
+      <button class="clear" type="button">Remove</button>
+    </div>
+    <div class="zone" id="zone-back">
+      <input type="file" id="file-back" accept=".jpg,.jpeg,.png,.webp" aria-label="Upload back of ID card" />
+      <div class="frame"><i></i><i></i><i></i><i></i></div>
+      <img alt="Back of ID preview" />
+      <div class="beam"></div>
+      <div class="hint">
+        <div class="side">Back of card</div>
+        <div class="sub">Drop an image here or tap to choose. Any angle or rotation is fine.</div>
+      </div>
+      <button class="clear" type="button">Remove</button>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button class="btn-scan" id="btnScan" disabled>Scan card</button>
+    <span class="formats">JPG · JPEG · PNG · WEBP, up to <span id="maxMb">10</span> MB per image</span>
+  </div>
+
+  <div class="banner" id="banner" role="alert"></div>
+
+  <div class="stages" id="stages" aria-hidden="true">
+    <div class="stage" data-s="0"><span class="n">01</span><span class="l">Detect card</span></div>
+    <div class="stage" data-s="1"><span class="n">02</span><span class="l">Rectify</span></div>
+    <div class="stage" data-s="2"><span class="n">03</span><span class="l">Orient</span></div>
+    <div class="stage" data-s="3"><span class="n">04</span><span class="l">Enhance</span></div>
+    <div class="stage" data-s="4"><span class="n">05</span><span class="l">OCR</span></div>
+    <div class="stage" data-s="5"><span class="n">06</span><span class="l">Parse fields</span></div>
+  </div>
+</main>
+
+<dialog id="resultDialog">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>Extraction results</h2>
+        <div class="meta" id="resultMeta"></div>
+      </div>
+      <button type="button" id="btnClose">Close</button>
+    </div>
+    <div class="modal-body">
+      <div class="panel-l">
+        <div><h3>Front — cropped &amp; rectified</h3><img class="cardimg" id="imgFront" alt="Processed front of card" /></div>
+        <div><h3>Back — cropped &amp; rectified</h3><img class="cardimg" id="imgBack" alt="Processed back of card" /></div>
+        <div id="portraitBlock">
+          <h3>Portrait</h3>
+          <div class="portrait-row">
+            <img id="imgPortrait" alt="Extracted portrait" />
+            <div class="note" id="portraitNote"></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel-r">
+        <h3>Extracted information</h3>
+        <div id="fields"></div>
+        <div class="checks" id="checks"></div>
+        <details>
+          <summary>Raw text read from the back of the card</summary>
+          <pre id="backText"></pre>
+        </details>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" id="btnJson" type="button">Download JSON</button>
+      <button class="btn-ghost" id="btnAgain" type="button">Scan another card</button>
+    </div>
+  </div>
+</dialog>
+
+<footer>IndangaScan MVP · optimized for the Rwandan National Identity Card · processed images are returned to your browser and are not stored on the server</footer>
+
+<script>
+(() => {
+  const files = { front: null, back: null };
+  const $ = (s) => document.querySelector(s);
+  const btnScan = $("#btnScan"), banner = $("#banner"), dialog = $("#resultDialog");
+  const stages = [...document.querySelectorAll(".stage")];
+  let lastResult = null, stageTimer = null;
+
+  fetch("/api/v1/health").then(r => r.json()).then(h => {
+    $("#engineTag").textContent = "engine: " + h.ocr_engine;
+    $("#maxMb").textContent = h.max_upload_mb;
+  }).catch(() => { $("#engineTag").textContent = "api offline"; });
+
+  function setupZone(side) {
+    const zone = $("#zone-" + side), input = $("#file-" + side), img = zone.querySelector("img");
+    const accept = (file) => {
+      if (!file) return;
+      if (!/\.(jpe?g|png|webp)$/i.test(file.name)) return showError("Unsupported file type. Please use JPG, JPEG, PNG or WEBP.", null);
+      files[side] = file;
+      img.src = URL.createObjectURL(file);
+      zone.classList.add("filled");
+      refresh();
+    };
+    input.addEventListener("change", () => accept(input.files[0]));
+    zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("dragover"); });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+    zone.addEventListener("drop", (e) => { e.preventDefault(); zone.classList.remove("dragover"); accept(e.dataTransfer.files[0]); });
+    zone.querySelector(".clear").addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      files[side] = null; input.value = ""; img.src = ""; zone.classList.remove("filled"); refresh();
+    });
+  }
+  setupZone("front"); setupZone("back");
+
+  function refresh() {
+    btnScan.disabled = !(files.front && files.back);
+    banner.classList.remove("show");
+  }
+
+  function showError(message, requestId) {
+    banner.innerHTML = message + (requestId ? '<span class="rid">request id: ' + requestId + "</span>" : "");
+    banner.classList.add("show");
+    banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function setScanning(on) {
+    ["front", "back"].forEach(s => $("#zone-" + s).classList.toggle("scanning", on));
+    btnScan.disabled = on || !(files.front && files.back);
+    btnScan.textContent = on ? "Scanning…" : "Scan card";
+    stages.forEach(s => s.classList.remove("active", "done"));
+    clearInterval(stageTimer);
+    if (on) {
+      let i = 0;
+      stages[0].classList.add("active");
+      stageTimer = setInterval(() => {              // paced illustration of the server pipeline
+        if (i < stages.length - 1) {
+          stages[i].classList.replace("active", "done");
+          stages[++i].classList.add("active");
+        }
+      }, 1500);
+    }
+  }
+
+  btnScan.addEventListener("click", async () => {
+    setScanning(true);
+    const body = new FormData();
+    body.append("front", files.front);
+    body.append("back", files.back);
+    try {
+      const res = await fetch("/api/v1/scan", { method: "POST", body });
+      const data = await res.json();
+      if (!res.ok) {
+        const err = data.error || {};
+        showError(err.message || "Something went wrong. Please try again.", err.request_id);
+        return;
+      }
+      stages.forEach(s => { s.classList.remove("active"); s.classList.add("done"); });
+      lastResult = data;
+      renderResults(data);
+      dialog.showModal();
+    } catch (e) {
+      showError("Could not reach the scanning service. Check your connection and try again.", null);
+    } finally {
+      setScanning(false);
+    }
+  });
+
+  function confLabel(c) { return "confidence " + c + "%"; }
+
+  function renderResults(d) {
+    $("#imgFront").src = d.images.front;
+    $("#imgBack").src = d.images.back;
+    const pb = $("#portraitBlock");
+    if (d.images.portrait) {
+      pb.style.display = "";
+      $("#imgPortrait").src = d.images.portrait;
+      $("#portraitNote").textContent = d.portrait.method === "face_detection"
+        ? "Located by face detection."
+        : "Located from the card layout — verify against the original.";
+    } else { pb.style.display = "none"; }
+
+    $("#resultMeta").textContent =
+      "processed in " + (d.processing_ms / 1000).toFixed(1) + "s · OCR confidence front " +
+      d.ocr_mean_confidence.front + "% / back " + d.ocr_mean_confidence.back + "%";
+
+    const wrap = $("#fields");
+    wrap.innerHTML = "";
+    d.fields.forEach(f => {
+      const row = document.createElement("div");
+      row.className = "field" + (f.low_confidence ? " low" : "");
+      const val = f.value
+        ? '<span class="v">' + esc(f.value) + '<span class="conf">' + confLabel(f.confidence) + "</span>" +
+          (f.notes ? '<span class="note">' + esc(f.notes) + "</span>" : "") + "</span>"
+        : '<span class="v missing">not found on card</span>';
+      row.innerHTML = '<span class="k">' + esc(f.label) + "</span>" + val;
+      wrap.appendChild(row);
+    });
+
+    const checks = $("#checks");
+    checks.innerHTML = "";
+    (d.validations || []).forEach(v => {
+      const el = document.createElement("div");
+      el.className = "check " + (v.passed ? "pass" : "fail");
+      el.textContent = (v.passed ? "✓ " : "✗ ") + v.check.replaceAll("_", " ");
+      checks.appendChild(el);
+    });
+    if (d.missing_required && d.missing_required.length) {
+      const el = document.createElement("div");
+      el.className = "check fail";
+      el.textContent = "✗ missing required: " + d.missing_required.join(", ");
+      checks.appendChild(el);
+    }
+
+    $("#backText").textContent = (d.back_text_lines || [])
+      .map(l => l.text + "   (" + l.confidence + "%)").join("\n") || "No readable text found.";
+  }
+
+  function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  $("#btnClose").addEventListener("click", () => dialog.close());
+  $("#btnAgain").addEventListener("click", () => {
+    dialog.close();
+    ["front", "back"].forEach(s => $("#zone-" + s).querySelector(".clear").click());
+    stages.forEach(s => s.classList.remove("active", "done"));
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  $("#btnJson").addEventListener("click", () => {
+    if (!lastResult) return;
+    const { images, ...rest } = lastResult;          // keep the export light
+    const blob = new Blob([JSON.stringify(rest, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "indangascan-result.json";
+    a.click();
+  });
+})();
+</script>
+</body>
+</html>
