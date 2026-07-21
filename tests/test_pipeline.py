@@ -104,7 +104,72 @@ def test_card_not_detected():
         assert type(exc).__name__ == "CardNotDetectedError"
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Passport tests (fictional data; check digits computed per ICAO 9303)
+# --------------------------------------------------------------------------- #
+
+def _fictional_mrz() -> tuple[str, str]:
+    from app.pipeline.mrz import _check_digit
+    doc = "PC1234567"
+    birth, expiry, personal = "900215", "300101", "<" * 14
+    l2 = (doc + _check_digit(doc) + "RWA" + birth + _check_digit(birth) + "F"
+          + expiry + _check_digit(expiry) + personal + _check_digit(personal))
+    l2 += _check_digit(doc + _check_digit(doc) + birth + _check_digit(birth)
+                       + expiry + _check_digit(expiry) + personal + _check_digit(personal))
+    return "PCRWAUWIMANA<<CLAUDINE<<<<<<<<<<<<<<<<<<<<<<", l2
+
+
+def test_mrz_parser():
+    from app.pipeline import mrz
+    l1, l2 = _fictional_mrz()
+    r = mrz.parse_td3(l1, l2)
+    assert r.valid, r.checks
+    assert r.passport_number == "PC1234567"
+    assert r.surname == "Uwimana" and r.given_names == "Claudine"
+    assert r.date_of_birth == "15/02/1990" and r.sex == "F" and r.date_of_expiry == "01/01/2030"
+
+    # OCR-noise robustness: spaces inside fields, K-for-< filler misreads
+    noisy2 = l2[:30] + "K<K" + l2[33:]
+    r2 = mrz.parse_td3(l1, noisy2.replace("RWA", "RW A"))
+    assert r2.passport_number == "PC1234567"
+
+
+def test_synthetic_passport_page():
+    from app.pipeline import processor
+    l1, l2 = _fictional_mrz()
+    page = np.full((900, 1300, 3), (235, 240, 240), dtype=np.uint8)
+
+    def put(text, y, scale=0.9, bold=2, x=60, color=(30, 30, 30)):
+        cv2.putText(page, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, bold, cv2.LINE_AA)
+
+    put("REPUBULIKA Y'U RWANDA / REPUBLIC OF RWANDA", 70, 0.9)
+    put("PASIPORO / PASSPORT", 130, 0.8)
+    put("Surname", 210, 0.55, 1, 60, (90, 90, 90)); put("UWIMANA", 250)
+    put("Other names", 320, 0.55, 1, 60, (90, 90, 90)); put("CLAUDINE", 360)
+    put("Date of birth", 430, 0.55, 1, 60, (90, 90, 90)); put("15 FEB/FEV 1990", 470)
+    put("Date of issue", 540, 0.55, 1, 60, (90, 90, 90)); put("01 JAN/JAN 2020", 580)
+    put("Issuing authority", 650, 0.55, 1, 60, (90, 90, 90)); put("GOVERNMENT OF RWANDA", 690)
+    put("Place of issue", 740, 0.55, 1, 60, (90, 90, 90)); put("KIGALI", 780)
+    put(l1, 840, 0.62, 1)
+    put(l2, 880, 0.62, 1)
+
+    res = processor.process_passport(page)
+    fields = {f["key"]: f for f in res["fields"]}
+    assert res["mrz"]["found"] and res["mrz"]["valid"], res["mrz"]
+    assert fields["passport_number"]["value"] == "PC1234567"
+    assert fields["surname"]["value"] == "Uwimana"
+    assert fields["date_of_birth"]["value"] == "15/02/1990"
+    assert fields["date_of_expiry"]["value"] == "01/01/2030"
+    assert fields["sex"]["value"] == "F"
+    assert fields["date_of_issue"]["value"] == "01/01/2020"
+    print("Passport synthetic OK:", {k: f["value"] for k, f in fields.items()})
+
+
 if __name__ == "__main__":
     test_full_pipeline()
     test_card_not_detected()
+    test_mrz_parser()
+    test_synthetic_passport_page()
     print("ALL TESTS PASSED")

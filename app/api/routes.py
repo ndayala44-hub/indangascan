@@ -9,7 +9,7 @@ import logging
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from app.config import settings
@@ -19,7 +19,7 @@ from app.core.errors import (
     MissingImageError,
     UnsupportedFormatError,
 )
-from app.pipeline.processor import process_id_card
+from app.pipeline.processor import process_id_card, process_passport
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
@@ -53,10 +53,17 @@ async def _read_and_decode(upload: UploadFile | None, side: str) -> np.ndarray:
 
 
 @router.post("/scan")
-async def scan(front: UploadFile | None = File(None), back: UploadFile | None = File(None)):
+async def scan(
+    front: UploadFile | None = File(None),
+    back: UploadFile | None = File(None),
+    doc_type: str = Form("national_id"),
+):
+    # The pipeline is CPU-bound OpenCV/Tesseract work; keep the event loop free.
+    if doc_type == "passport":
+        page_img = await _read_and_decode(front, "passport page")
+        return await run_in_threadpool(process_passport, page_img)
     front_img = await _read_and_decode(front, "front")
     back_img = await _read_and_decode(back, "back")
-    # The pipeline is CPU-bound OpenCV/Tesseract work; keep the event loop free.
     return await run_in_threadpool(process_id_card, front_img, back_img)
 
 

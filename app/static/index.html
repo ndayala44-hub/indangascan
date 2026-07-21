@@ -32,7 +32,13 @@
   .lede p{color:var(--muted);max-width:56ch;margin-top:10px}
 
   /* ---- Viewfinder drop zones (signature element) ---- */
-  .capture{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:34px}
+  .doctype{display:inline-flex;margin-top:30px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .dt{background:var(--panel);color:var(--muted);border:0;padding:10px 22px;font-size:.88rem;font-weight:500}
+  .dt.active{background:var(--panel-2);color:var(--sun)}
+  .capture{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:22px}
+  .capture.passport{grid-template-columns:1fr;max-width:560px}
+  .capture.passport .zone{aspect-ratio:125/88}
+  body.pp #zone-back{display:none}
   @media(max-width:720px){.capture{grid-template-columns:1fr}}
   .zone{position:relative;aspect-ratio:856/540;background:var(--panel);border-radius:14px;border:1px solid var(--line);overflow:hidden;cursor:pointer;transition:border-color .2s}
   .zone:hover,.zone.dragover{border-color:var(--teal)}
@@ -132,6 +138,11 @@
        score you can verify against the original.</p>
   </section>
 
+  <div class="doctype" role="tablist" aria-label="Document type">
+    <button class="dt active" id="dt-id" role="tab" aria-selected="true">National ID card</button>
+    <button class="dt" id="dt-pp" role="tab" aria-selected="false">Passport</button>
+  </div>
+
   <section class="capture" aria-label="Card upload">
     <div class="zone" id="zone-front">
       <input type="file" id="file-front" accept=".jpg,.jpeg,.png,.webp" aria-label="Upload front of ID card" />
@@ -139,7 +150,7 @@
       <img alt="Front of ID preview" />
       <div class="beam"></div>
       <div class="hint">
-        <div class="side">Front of card</div>
+        <div class="side" id="frontHint">Front of card</div>
         <div class="sub">Drop an image here or tap to choose. Any angle or rotation is fine.</div>
       </div>
       <button class="clear" type="button">Remove</button>
@@ -199,7 +210,11 @@
         <h3>Extracted information</h3>
         <div id="fields"></div>
         <div class="checks" id="checks"></div>
-        <details>
+        <details id="mrzBlock" style="display:none">
+          <summary>Machine Readable Zone (MRZ)</summary>
+          <pre id="mrzText"></pre>
+        </details>
+        <details id="backBlock">
           <summary>Raw text read from the back of the card</summary>
           <pre id="backText"></pre>
         </details>
@@ -217,6 +232,7 @@
 <script>
 (() => {
   const files = { front: null, back: null };
+  let docType = "national_id";
   const $ = (s) => document.querySelector(s);
   const btnScan = $("#btnScan"), banner = $("#banner"), dialog = $("#resultDialog");
   const stages = [...document.querySelectorAll(".stage")];
@@ -249,9 +265,23 @@
   setupZone("front"); setupZone("back");
 
   function refresh() {
-    btnScan.disabled = !(files.front && files.back);
+    btnScan.disabled = docType === "passport" ? !files.front : !(files.front && files.back);
     banner.classList.remove("show");
   }
+
+  function setDocType(t) {
+    docType = t;
+    document.body.classList.toggle("pp", t === "passport");
+    document.querySelector(".capture").classList.toggle("passport", t === "passport");
+    $("#dt-id").classList.toggle("active", t === "national_id");
+    $("#dt-pp").classList.toggle("active", t === "passport");
+    $("#dt-id").setAttribute("aria-selected", t === "national_id");
+    $("#dt-pp").setAttribute("aria-selected", t === "passport");
+    $("#frontHint").textContent = t === "passport" ? "Passport bio-data page" : "Front of card";
+    refresh();
+  }
+  $("#dt-id").addEventListener("click", () => setDocType("national_id"));
+  $("#dt-pp").addEventListener("click", () => setDocType("passport"));
 
   function showError(message, requestId) {
     banner.innerHTML = message + (requestId ? '<span class="rid">request id: ' + requestId + "</span>" : "");
@@ -280,8 +310,9 @@
   btnScan.addEventListener("click", async () => {
     setScanning(true);
     const body = new FormData();
+    body.append("doc_type", docType);
     body.append("front", files.front);
-    body.append("back", files.back);
+    if (docType !== "passport" && files.back) body.append("back", files.back);
     try {
       const res = await fetch("/api/v1/scan", { method: "POST", body });
       const data = await res.json();
@@ -304,8 +335,18 @@
   function confLabel(c) { return "confidence " + c + "%"; }
 
   function renderResults(d) {
+    const isPassport = d.document_type === "passport";
     $("#imgFront").src = d.images.front;
-    $("#imgBack").src = d.images.back;
+    $("#imgFront").previousElementSibling.textContent = isPassport
+      ? "BIO-DATA PAGE — CROPPED" : "FRONT — CROPPED & RECTIFIED";
+    $("#imgBack").parentElement.style.display = d.images.back ? "" : "none";
+    if (d.images.back) $("#imgBack").src = d.images.back;
+    $("#mrzBlock").style.display = d.mrz && d.mrz.found ? "" : "none";
+    if (d.mrz && d.mrz.found) {
+      $("#mrzText").textContent = d.mrz.lines.join("\n") + "\n\nCheck digits: " +
+        Object.entries(d.mrz.checks).map(([k, v]) => k + "=" + (v ? "ok" : "FAIL")).join("  ");
+    }
+    $("#backBlock").style.display = isPassport ? "none" : "";
     const pb = $("#portraitBlock");
     if (d.images.portrait) {
       pb.style.display = "";

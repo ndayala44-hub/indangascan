@@ -1,6 +1,6 @@
-# IndangaScan — Rwandan National ID Scanner (MVP)
+# IndangaScan — Rwandan National ID & Passport Scanner (MVP)
 
-A production-quality MVP web application, in the spirit of BlinkID, optimized for the Rwandan National Identity Card. Upload the front and back of a card and the system will detect the card, crop it, correct perspective and orientation, enhance the image, run OCR, extract structured fields with per-field confidence scores, and pull out the holder's portrait.
+A production-quality MVP web application, in the spirit of BlinkID, optimized for Rwandan identity documents. It scans both the Rwandan National Identity Card (front and back) and the Rwandan passport bio-data page: detection, cropping, orientation correction, image enhancement, OCR, structured field extraction with per-field confidence scores, portrait extraction, and document-level cross-validation.
 
 ## What it does
 
@@ -25,7 +25,9 @@ app/
 │   ├── enhance.py           Division-normalization OCR prep + display pipeline
 │   ├── ocr.py               Engine abstraction (Tesseract default, EasyOCR optional)
 │   ├── regions.py           Calibrated per-field region OCR (single-line passes)
-│   ├── parser.py            Spec-driven field extraction, region merge, NID cross-validation
+│   ├── mrz.py               ICAO 9303 TD3 MRZ parser: check digits + OCR repair
+│   ├── parser.py            Spec-driven ID field extraction, region merge, NID cross-validation
+│   ├── passport_parser.py   Passport VIZ extraction with MRZ authority/override
 │   └── portrait.py          Haar-cascade face crop with layout fallback
 └── static/index.html        Responsive frontend (no build step required)
 tests/test_pipeline.py       End-to-end smoke test on a synthetic warped card photo
@@ -72,6 +74,12 @@ The container runs anywhere Docker runs. Straightforward options:
 ## Configuration
 
 All via environment variables (see `.env.example`): `MAX_UPLOAD_MB`, `ALLOWED_EXTENSIONS`, `MIN_IMAGE_DIMENSION`, `OCR_ENGINE` (`tesseract` or `easyocr`), `TESSERACT_LANG`, `LOW_CONFIDENCE_THRESHOLD`, `LOG_LEVEL`, `LOG_JSON`, `CORS_ORIGINS`.
+
+## Passport support
+
+Select the document type in the UI (or pass `doc_type=passport` to `POST /api/v1/scan` with a single `front` image of the bio-data page). The pipeline locates the page (header-to-MRZ), corrects orientation, and extracts every field: passport number, surname, given names, nationality, date of birth, sex, place of birth, dates of issue and expiry, issuing authority, place of issue, and personal number, plus the raw MRZ with per-field check-digit results.
+
+The MRZ is treated as authoritative: it is parsed per ICAO 9303 (TD3) with all five check digits computed, OCR confusions repaired positionally (O/0, I/1, filler '<' misread as K/R/C/E, line-length reconciliation), and every field it covers overrides the visual zone at verified confidence. The three visual-zone dates are disambiguated against the MRZ (the issue date is the one that is neither the checksummed birth nor expiry date). Fields the MRZ does not carry (place of birth, date of issue, issuing authority, place of issue) come from label-anchored visual-zone extraction with the standard low-confidence review flags.
 
 ## Performance and accuracy design
 

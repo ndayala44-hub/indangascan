@@ -35,6 +35,8 @@ class OcrLine:
     text: str
     confidence: float                     # 0-100, mean of word confidences
     words: list[tuple[str, float]] = field(default_factory=list)
+    top: int = 0                          # bounding box in OCR-image pixels
+    bottom: int = 0
 
 
 @dataclass
@@ -69,8 +71,10 @@ def _run_tesseract(gray: np.ndarray) -> OcrResult:
         if not word or conf < 0:
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        line = lines.setdefault(key, OcrLine(text="", confidence=0.0))
+        line = lines.setdefault(key, OcrLine(text="", confidence=0.0, top=10**9, bottom=0))
         line.words.append((word, conf))
+        line.top = min(line.top, data["top"][i])
+        line.bottom = max(line.bottom, data["top"][i] + data["height"][i])
 
     result_lines = []
     for line in lines.values():

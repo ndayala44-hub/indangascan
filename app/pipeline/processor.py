@@ -21,7 +21,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from app.pipeline import detector, enhance, ocr, orientation, parser, portrait, regions
+from app.pipeline import detector, enhance, mrz, ocr, orientation, parser, passport_parser, portrait, regions
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,68 @@ def _process_side(image: np.ndarray, side: str) -> dict[str, Any]:
     }
 
 
+def _passport_page_bounds(ocr_result) -> tuple[int, int] | None:
+    """Find (top, bottom) of the bio page from the primary pass's line boxes."""
+    header_y = None
+    mrz_bottom = None
+    for line in ocr_result.lines:
+        text = line.text.upper()
+        if header_y is None and any(k in text for k in ("REPUBULIKA", "PASIPORO", "PASSEPORT")):
+            header_y = line.top
+        if line.text.count("<") >= 4:
+            mrz_bottom = max(mrz_bottom or 0, line.bottom)
+    if header_y is not None and mrz_bottom is not None and mrz_bottom > header_y:
+        return header_y, mrz_bottom
+    return None
+
+
+def process_passport(page: np.ndarray) -> dict[str, Any]:
+    started = time.perf_counter()
+
+    detector.validate_image_quality(page, "passport")
+    page, rotation = orientation.correct_orientation(page, "passport")
+    normalized = enhance.ocr_normalize(page)
+
+    ocr_results = [ocr.run_ocr(normalized, "passport/primary")]
+    if ocr_results[0].mean_confidence < FALLBACK_CONFIDENCE:
+        ocr_results.append(ocr.run_ocr(enhance.ocr_fallback(page), "passport/fallback"))
+
+    mrz_result = mrz.parse_from_text(max(ocr_results, key=lambda r: r.mean_confidence).full_text)
+
+    parsed = passport_parser.parse_passport(ocr_results, mrz_result)
+
+    # Display crop: header-to-MRZ band of the page (2x normalized -> original px)
+    bounds = _passport_page_bounds(ocr_results[0])
+    if bounds:
+        y0 = max(0, int(bounds[0] / 2) - 14)
+        y1 = min(page.shape[0], int(bounds[1] / 2) + 14)
+        page_crop = page[y0:y1]
+    else:
+        page_crop = page
+
+    face_img, face_conf, face_method = portrait.extract_portrait(page_crop)
+    display = enhance.enhance_for_display(page_crop)
+
+    total_ms = (time.perf_counter() - started) * 1000
+    logger.info("Passport scan complete", extra={"data": {"total_ms": round(total_ms),
+                                                          "mrz_valid": mrz_result.valid}})
+    best = max(ocr_results, key=lambda r: r.mean_confidence)
+    return {
+        "status": "ok",
+        "document_type": "passport",
+        "processing_ms": round(total_ms),
+        "images": {
+            "front": _b64_jpeg(display),
+            "back": None,
+            "portrait": _b64_jpeg(face_img) if face_img is not None else None,
+        },
+        "portrait": {"found": face_img is not None, "confidence": float(face_conf), "method": face_method},
+        "detection": {"front": {"confidence": 1.0 if bounds else 0.5, "rotation_applied": rotation}},
+        "ocr_mean_confidence": {"front": round(float(best.mean_confidence), 1)},
+        **parsed,
+    }
+
+
 def process_id_card(front: np.ndarray, back: np.ndarray) -> dict[str, Any]:
     started = time.perf_counter()
 
@@ -104,6 +166,7 @@ def process_id_card(front: np.ndarray, back: np.ndarray) -> dict[str, Any]:
     best_back = max(back_res["ocr_results"], key=lambda r: r.mean_confidence)
     return {
         "status": "ok",
+        "document_type": "national_id",
         "processing_ms": round(total_ms),
         "images": {
             "front": _b64_jpeg(front_display),

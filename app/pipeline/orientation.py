@@ -40,6 +40,10 @@ CARD_KEYWORDS = {
     "umukono", "nyirayo", "signature", "found", "please", "return", "nearest",
     "whoever", "uses", "this", "contrary", "law", "will", "punished",
     "uzayikoresha", "karita", "police",
+    # Passport bio-data page vocabulary
+    "pasiporo", "passport", "passeport", "pasipoti", "republique", "jamhuri",
+    "surname", "nom", "prenoms", "nationality", "nationalite", "government",
+    "naissance", "delivrance", "expiry", "authority", "kigali",
 }
 
 
