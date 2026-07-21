@@ -31,7 +31,8 @@ app/
 │   ├── face.py              Face detection/embedding/matching (SFace prod, HOG demo)
 ├── verification/
 │   ├── liveness.py          Randomized challenge liveness + passive anti-spoofing
-│   └── session.py           In-memory TTL biometric sessions (Redis-swappable)
+│   ├── pose.py              solvePnP head pose (yaw/pitch/roll in degrees)
+│   └── session.py           In-memory TTL biometric sessions (capped, Redis-swappable)
 ├── api/verify_routes.py     /verify/challenge and /verify/complete endpoints
 │   └── portrait.py          Haar-cascade face crop with layout fallback
 └── static/index.html        Responsive frontend (no build step required)
@@ -88,7 +89,7 @@ The MRZ is treated as authoritative: it is parsed per ICAO 9303 (TD3) with all f
 
 ## Identity verification (liveness + face matching)
 
-After a successful scan that yields a document portrait, the response carries a single-use verification session token and a randomized set of liveness challenges. The UI's "Verify identity" flow opens the user's camera, guides them through each challenge with real-time pass/fail feedback. Challenges are verified server-side from short frame bursts; with MediaPipe installed (default in requirements.txt) verification uses face-mesh landmarks - eye aspect ratio for blinks, mouth geometry for smiles, signed head yaw for turns - which is deterministic and direction-aware. Without MediaPipe the system falls back to Haar-cascade heuristics, clearly labeled in responses, then captures a final frame and matches the live face against the document portrait.
+After a successful scan that yields a document portrait, the response carries a single-use verification session token and a randomized set of liveness challenges. The UI's "Verify identity" flow opens the user's camera, guides them through each challenge with real-time pass/fail feedback. Six challenges are supported (blink, smile, turn left/right, look up/down) and verified server-side from short frame bursts. With MediaPipe installed (default in requirements.txt) the system runs metric head-pose estimation - six face-mesh landmarks solved against a generic 3D face model with cv2.solvePnP, decomposed to yaw/pitch/roll in degrees, with sign conventions pinned by a synthetic projection round-trip in the test suite. Pose deltas are measured against each burst's own starting pose (adaptive baseline), so natural, unexaggerated motion passes regardless of how the user initially holds their head, and thresholds are environment-tunable (LIVENESS_TURN_DEG, LIVENESS_PITCH_DEG). Each burst gets a fresh FaceMesh instance in static mode - a deliberate correctness decision: shared tracking-mode instances leak state across users, are not thread-safe, and coast on stale frontal landmarks during fast head turns. Without MediaPipe the system falls back to Haar-cascade heuristics, clearly labeled in responses, then captures a final frame and matches the live face against the document portrait.
 
 Face matching runs on OpenCV's production stack: YuNet detection with SFace embeddings and the published cosine threshold. The two ONNX models are fetched once by `scripts/download_models.sh` (wired into the devcontainer and Dockerfile). Without them the system runs in an explicitly labeled demo mode: liveness still works, similarity is reported as indicative, and identity is never confirmed - measured tests showed classical features cannot separate same-person from impostor pairs reliably, so demo mode refuses to render a Verified verdict rather than render a false one.
 

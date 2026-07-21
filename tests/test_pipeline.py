@@ -214,24 +214,61 @@ def test_session_store_and_offer():
 
     assert _verification_offer(None, "national_id") == {"available": False, "reason": "no_portrait"}
 
-def test_liveness_landmark_logic():
+def test_head_pose_round_trip():
+    """Rotate the 3D model by known angles, project, re-estimate: signs and
+    magnitudes must survive the round trip (pins the pose conventions)."""
+    import math
+    from app.verification.pose import MODEL_POINTS, camera_matrix, estimate_pose
+    W, H = 640, 480
+    K = camera_matrix(W, H)
+
+    def project(yaw_deg, pitch_deg):
+        base = np.diag([1.0, -1.0, -1.0])
+        y, p = math.radians(yaw_deg), math.radians(pitch_deg)
+        ry = np.array([[math.cos(y), 0, math.sin(y)], [0, 1, 0], [-math.sin(y), 0, math.cos(y)]])
+        rx = np.array([[1, 0, 0], [0, math.cos(p), -math.sin(p)], [0, math.sin(p), math.cos(p)]])
+        rvec, _ = cv2.Rodrigues(base @ ry @ rx)
+        t = np.array([[0.0], [0.0], [400.0]])
+        pts, _ = cv2.projectPoints(MODEL_POINTS, rvec, t, K, None)
+        return pts.reshape(6, 2)
+
+    for yaw_in, pitch_in in [(20, 0), (-20, 0), (0, 15), (0, -15), (18, 12)]:
+        yaw, pitch, _ = estimate_pose(project(yaw_in, pitch_in), W, H)
+        assert abs(yaw - yaw_in) < 1.0, (yaw_in, yaw)
+        assert abs(pitch - pitch_in) < 1.0, (pitch_in, pitch)
+
+
+def test_liveness_pose_logic():
     from app.verification.liveness import (
-        FrameFeatures, verify_blink, verify_smile, verify_turn_left, verify_turn_right,
+        FrameFeatures, verify_blink, verify_smile,
+        verify_turn_left, verify_turn_right, verify_look_up, verify_look_down,
     )
     F = lambda **kw: FrameFeatures(**{"face": (0, 0, 100, 100), **kw})
 
     assert verify_blink([F(ear=0.30), F(ear=0.31), F(ear=0.12), F(ear=0.29), F(ear=0.30)])
     assert not verify_blink([F(ear=0.30)] * 6)
-
     assert verify_smile([F(mouth_ratio=0.42), F(mouth_ratio=0.42),
                          F(mouth_ratio=0.50), F(mouth_ratio=0.51)])
-    assert not verify_smile([F(mouth_ratio=0.42)] * 5)
 
-    left = [F(yaw=0.0), F(yaw=0.10), F(yaw=0.20), F(yaw=0.22)]
-    right = [F(yaw=0.0), F(yaw=-0.12), F(yaw=-0.21), F(yaw=-0.20)]
+    left = [F(yaw=2.0), F(yaw=3.0), F(yaw=11.0), F(yaw=18.0), F(yaw=17.0)]
+    right = [F(yaw=1.0), F(yaw=-9.0), F(yaw=-16.0), F(yaw=-17.0)]
     assert verify_turn_left(left) and not verify_turn_right(left)
     assert verify_turn_right(right) and not verify_turn_left(right)
+    # Adaptive baseline: a user starting off-center is judged on the delta.
+    off = [F(yaw=-8.0), F(yaw=-7.0), F(yaw=4.0), F(yaw=8.0), F(yaw=7.5)]
+    assert verify_turn_left(off)
+    # A full turn that rotates the face out of detection still passes.
+    full = [F(yaw=2.0), F(yaw=9.0), FrameFeatures(), FrameFeatures(), FrameFeatures()]
+    assert verify_turn_left(full)
 
+    up = [F(pitch=0.0), F(pitch=1.0), F(pitch=9.0), F(pitch=13.0), F(pitch=12.0)]
+    down = [F(pitch=2.0), F(pitch=-6.0), F(pitch=-11.0), F(pitch=-12.0)]
+    assert verify_look_up(up) and not verify_look_down(up)
+    assert verify_look_down(down) and not verify_look_up(down)
+
+    still = [F(yaw=1.0, pitch=1.0)] * 6
+    for v in (verify_turn_left, verify_turn_right, verify_look_up, verify_look_down):
+        assert not v(still)
 
 
 if __name__ == "__main__":
@@ -241,5 +278,6 @@ if __name__ == "__main__":
     test_synthetic_passport_page()
     test_liveness_logic()
     test_session_store_and_offer()
-    test_liveness_landmark_logic()
+    test_head_pose_round_trip()
+    test_liveness_pose_logic()
     print("ALL TESTS PASSED")

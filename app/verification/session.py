@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 SESSION_TTL_SECONDS = 600
+MAX_SESSIONS = 500  # bounds memory under abuse; oldest are pruned first
 
 
 @dataclass
@@ -57,6 +58,9 @@ class SessionStore:
         )
         with self._lock:
             self._prune()
+            if len(self._sessions) >= MAX_SESSIONS:
+                oldest = min(self._sessions.values(), key=lambda x: x.created_at)
+                del self._sessions[oldest.token]
             self._sessions[session.token] = session
         return session
 

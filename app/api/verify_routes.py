@@ -48,7 +48,7 @@ class NoLiveFaceError(AppError):
     user_message = "No face could be detected in the camera capture. Face the camera in good light and try again."
 
 
-def _decode_frames(uploads: list[UploadFile], data: list[bytes]) -> list[np.ndarray]:
+def _decode_frames(data: list[bytes]) -> list[np.ndarray]:
     frames = []
     for blob in data:
         img = cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_COLOR)
@@ -65,7 +65,7 @@ async def challenge(token: str = Form(...), challenge: str = Form(...),
     if session is None or challenge not in session.challenges:
         raise SessionError(f"token or challenge invalid: {challenge}")
     blobs = [await f.read() for f in frames]
-    decoded = _decode_frames(frames, blobs)
+    decoded = _decode_frames(blobs)
     result = await run_in_threadpool(liveness.verify_challenge, challenge, decoded)
     if result["passed"]:
         session.completed[challenge] = True

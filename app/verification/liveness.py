@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 
 from app.pipeline import face as face_module
+from app.verification import pose
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +39,27 @@ logger = logging.getLogger(__name__)
 # deterministically. Falls back to Haar-cascade heuristics when absent.
 try:
     import mediapipe as mp
-    _FACEMESH = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1, refine_landmarks=False,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
-    )
+    _MP_AVAILABLE = True
     LIVENESS_ENGINE = "mediapipe"
 except Exception:  # not installed / unsupported platform
-    _FACEMESH = None
+    _MP_AVAILABLE = False
     LIVENESS_ENGINE = "cascades"
+
+
+def _new_facemesh():
+    """
+    One FaceMesh per burst, in STATIC mode. This is deliberate and is the
+    fix for the head-turn failure: a shared instance in video/tracking mode
+    (a) is not thread-safe under concurrent requests, (b) leaks tracking
+    state between users' bursts, and (c) coasts on stale near-frontal
+    landmarks during fast head turns - reporting yaw ~ 0 with a face still
+    "present", which defeated both the yaw check and the face-loss
+    fallback. Static mode detects every frame independently.
+    """
+    return mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True, max_num_faces=1, refine_landmarks=False,
+        min_detection_confidence=0.5,
+    )
 
 # FaceMesh landmark indices (canonical face mesh topology).
 _L_EYE = (33, 160, 158, 133, 153, 144)   # p1..p6 for EAR
@@ -61,17 +75,29 @@ CHALLENGES = {
     "smile": "Smile",
     "turn_left": "Turn your head to your left",
     "turn_right": "Turn your head to your right",
+    "look_up": "Tilt your head up",
+    "look_down": "Tilt your head down",
 }
+# Pitch challenges need metric head pose; the cascade fallback can't judge them.
+_CASCADE_CHALLENGES = ["blink", "smile", "turn_left", "turn_right"]
 
 CHALLENGES_PER_SESSION = 2
+
+# Degree thresholds, environment-tunable. Deltas are measured against each
+# burst's own starting pose (adaptive baseline), so a user who begins
+# slightly off-center is not penalized and no exaggerated motion is needed.
+import os
+TURN_DELTA_DEG = float(os.getenv("LIVENESS_TURN_DEG", 13.0))
+PITCH_DELTA_DEG = float(os.getenv("LIVENESS_PITCH_DEG", 10.0))
 MIN_FRAMES = 5
-MAX_FRAMES = 16
+MAX_FRAMES = 16  # turn bursts send 12
 # Set to true if a deployment's camera pipeline mirrors frames.
 TURN_INVERTED = False
 
 
 def pick_challenges() -> list[str]:
-    return random.sample(list(CHALLENGES), CHALLENGES_PER_SESSION)
+    pool = list(CHALLENGES) if LIVENESS_ENGINE == "mediapipe" else _CASCADE_CHALLENGES
+    return random.sample(pool, CHALLENGES_PER_SESSION)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,9 +113,10 @@ class FrameFeatures:
     profile_right: bool = False
     motion: float = 0.0   # mean abs diff vs previous frame within face region
     # Landmark-based signals (MediaPipe engine only; None under cascades)
-    ear: float | None = None       # eye aspect ratio - drops sharply on blink
+    ear: float | None = None          # eye aspect ratio - drops sharply on blink
     mouth_ratio: float | None = None  # mouth width / inter-cheek width
-    yaw: float | None = None       # signed head yaw: + = subject's left
+    yaw: float | None = None          # head yaw, degrees; + = subject's left
+    pitch: float | None = None        # head pitch, degrees; + = looking up
 
 
 def _ear(pts, idx) -> float:
@@ -103,28 +130,34 @@ def _ear(pts, idx) -> float:
 def _extract_mediapipe(frames: list[np.ndarray]) -> list[FrameFeatures]:
     out: list[FrameFeatures] = []
     prev_gray = None
-    for bgr in frames:
-        f = FrameFeatures()
-        h, w = bgr.shape[:2]
-        res = _FACEMESH.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        if res.multi_face_landmarks:
-            pts = np.array([[lm.x * w, lm.y * h] for lm in res.multi_face_landmarks[0].landmark],
-                           dtype=np.float32)
-            xs, ys = pts[:, 0], pts[:, 1]
-            x0, y0 = int(max(0, xs.min())), int(max(0, ys.min()))
-            x1, y1 = int(min(w, xs.max())), int(min(h, ys.max()))
-            f.face = (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
-            f.ear = (_ear(pts, _L_EYE) + _ear(pts, _R_EYE)) / 2.0
-            cheek_w = float(np.linalg.norm(pts[_CHEEK_R] - pts[_CHEEK_L])) + 1e-6
-            f.mouth_ratio = float(np.linalg.norm(pts[_MOUTH_R] - pts[_MOUTH_L])) / cheek_w
-            nose_pos = (float(pts[_NOSE_TIP][0]) - float(pts[_CHEEK_L][0])) / cheek_w
-            f.yaw = nose_pos - 0.5  # + means nose toward image-right = subject's left
-            if prev_gray is not None and prev_gray.shape == gray.shape:
-                diff = cv2.absdiff(gray[y0:y1, x0:x1], prev_gray[y0:y1, x0:x1])
-                f.motion = float(diff.mean()) if diff.size else 0.0
-        prev_gray = gray
-        out.append(f)
+    with _new_facemesh() as mesh:
+        for bgr in frames:
+            f = FrameFeatures()
+            h, w = bgr.shape[:2]
+            res = mesh.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            if res.multi_face_landmarks:
+                pts = np.array(
+                    [[lm.x * w, lm.y * h] for lm in res.multi_face_landmarks[0].landmark],
+                    dtype=np.float32)
+                xs, ys = pts[:, 0], pts[:, 1]
+                x0, y0 = int(max(0, xs.min())), int(max(0, ys.min()))
+                x1, y1 = int(min(w, xs.max())), int(min(h, ys.max()))
+                f.face = (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+                f.ear = (_ear(pts, _L_EYE) + _ear(pts, _R_EYE)) / 2.0
+                cheek_w = float(np.linalg.norm(pts[_CHEEK_R] - pts[_CHEEK_L])) + 1e-6
+                f.mouth_ratio = float(np.linalg.norm(pts[_MOUTH_R] - pts[_MOUTH_L])) / cheek_w
+                image_pts = np.array([pts[pose.POSE_LANDMARKS[k]] for k in (
+                    "nose_tip", "chin", "right_eye_outer", "left_eye_outer",
+                    "mouth_right", "mouth_left")], dtype=np.float64)
+                angles = pose.estimate_pose(image_pts, w, h)
+                if angles:
+                    f.yaw, f.pitch = angles[0], angles[1]
+                if prev_gray is not None and prev_gray.shape == gray.shape:
+                    diff = cv2.absdiff(gray[y0:y1, x0:x1], prev_gray[y0:y1, x0:x1])
+                    f.motion = float(diff.mean()) if diff.size else 0.0
+            prev_gray = gray
+            out.append(f)
     return out
 
 
@@ -208,25 +241,48 @@ def verify_smile(feats: list[FrameFeatures]) -> bool:
     return sum(1 for f in feats if f.smile) >= 2
 
 
+def _pose_baseline(values: list[float]) -> float:
+    """
+    Adaptive per-burst baseline: the pose at the start of the burst, before
+    the user moves. Recording begins as the instruction is given, so the
+    first frames are neutral; on short sequences trust the first frame.
+    """
+    head = values[:3] if len(values) >= 6 else values[:1]
+    return float(np.median(head))
+
+
 def _verify_turn(feats: list[FrameFeatures], left: bool) -> bool:
     if TURN_INVERTED:
         left = not left
     yaws = [f.yaw for f in feats if f.yaw is not None]
-    if len(yaws) >= 3:
-        # Landmark path: signed yaw from nose position between the cheeks.
-        # + yaw = nose toward image-right = the subject's left (raw camera
-        # frames are un-mirrored; the preview mirror is display-only).
-        peak = max(yaws) if left else -min(yaws)
-        correct = sum(1 for y in yaws if (y if left else -y) > 0.15)
-        wrong = sum(1 for y in yaws if (-y if left else y) > 0.15)
-        return peak > 0.17 and correct >= 2 and wrong == 0
+    if len(yaws) >= 2:
+        baseline = _pose_baseline(yaws)
+        signed = [((y - baseline) if left else (baseline - y)) for y in yaws]
+        peak = max(signed)
+        correct = sum(1 for v in signed if v > TURN_DELTA_DEG * 0.75)
+        wrong = sum(1 for v in signed if v < -TURN_DELTA_DEG)
+        logger.info("Turn trace", extra={"data": {
+            "left": left, "baseline_deg": round(baseline, 1),
+            "delta_deg": [round(v, 1) for v in signed]}})
+        if peak > TURN_DELTA_DEG and correct >= 2 and wrong < correct:
+            return True
+        # A full turn rotates the face out of the detector's range: accept a
+        # correct-direction motion followed by losing the face mid-burst.
+        present = [f.face is not None for f in feats]
+        early_present = any(present[: max(2, len(present) // 3)])
+        lost_later = sum(1 for p in present[len(present) // 2:] if not p) >= 2
+        rising = signed[-1] - signed[0] if len(signed) >= 2 else 0.0
+        if early_present and lost_later and (
+            signed[-1] > TURN_DELTA_DEG * 0.4 or rising > TURN_DELTA_DEG * 0.4
+        ):
+            return True
+        return False
+    # Cascade path (unchanged)
     profile_hits = sum(
         1 for f in feats if (f.profile_left if left else f.profile_right) and not f.face
     )
     if profile_hits >= 1:
         return True
-    # Secondary signal: frontal face tracked drifting toward the turn side
-    # before being lost mid-sequence.
     xs = [f.face[0] + f.face[2] / 2 for f in feats if f.face]
     if len(xs) >= 3 and _face_presence(feats) < 0.9:
         drift = xs[-1] - xs[0]
@@ -234,6 +290,28 @@ def _verify_turn(feats: list[FrameFeatures], left: bool) -> bool:
         if abs(drift) > 0.15 * float(np.mean(widths)):
             return (drift < 0) if left else (drift > 0)
     return False
+
+
+def verify_look_up(feats: list[FrameFeatures]) -> bool:
+    return _verify_pitch(feats, up=True)
+
+
+def verify_look_down(feats: list[FrameFeatures]) -> bool:
+    return _verify_pitch(feats, up=False)
+
+
+def _verify_pitch(feats: list[FrameFeatures], up: bool) -> bool:
+    pitches = [f.pitch for f in feats if f.pitch is not None]
+    if len(pitches) < 3:
+        return False
+    baseline = _pose_baseline(pitches)
+    signed = [((p - baseline) if up else (baseline - p)) for p in pitches]
+    correct = sum(1 for v in signed if v > PITCH_DELTA_DEG * 0.75)
+    wrong = sum(1 for v in signed if v < -PITCH_DELTA_DEG)
+    logger.info("Pitch trace", extra={"data": {
+        "up": up, "baseline_deg": round(baseline, 1),
+        "delta_deg": [round(v, 1) for v in signed]}})
+    return max(signed) > PITCH_DELTA_DEG and correct >= 2 and wrong < correct
 
 
 def verify_turn_left(feats: list[FrameFeatures]) -> bool:
@@ -249,6 +327,8 @@ _VERIFIERS = {
     "smile": verify_smile,
     "turn_left": verify_turn_left,
     "turn_right": verify_turn_right,
+    "look_up": verify_look_up,
+    "look_down": verify_look_down,
 }
 
 
