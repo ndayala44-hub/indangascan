@@ -69,4 +69,8 @@ async def scan(
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "ocr_engine": settings.ocr_engine, "max_upload_mb": settings.max_upload_mb}
+    from app.pipeline.face import ENGINE as face_engine
+    from app.verification.liveness import LIVENESS_ENGINE
+    return {"status": "ok", "ocr_engine": settings.ocr_engine,
+            "face_engine": face_engine, "liveness_engine": LIVENESS_ENGINE,
+            "max_upload_mb": settings.max_upload_mb}

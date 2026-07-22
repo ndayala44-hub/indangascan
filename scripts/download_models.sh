@@ -12,4 +12,7 @@ curl -fL -o "$DIR/face_detection_yunet_2023mar.onnx" \
 echo "Downloading SFace face recognizer..."
 curl -fL -o "$DIR/face_recognition_sface_2021dec.onnx" \
   "$BASE/face_recognition_sface/face_recognition_sface_2021dec.onnx"
-echo "Done. Restart the server to activate the production face engine."
+echo "Downloading MediaPipe FaceLandmarker (liveness head-pose model)..."
+curl -fL -o "$DIR/face_landmarker.task" \
+  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+echo "Done. Restart the server to activate the production face + liveness engines."

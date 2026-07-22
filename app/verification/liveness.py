@@ -37,29 +37,55 @@ logger = logging.getLogger(__name__)
 # Optional precision engine: MediaPipe FaceMesh gives 468 landmarks, from
 # which eye aperture (EAR), mouth geometry and signed head yaw are computed
 # deterministically. Falls back to Haar-cascade heuristics when absent.
+# MediaPipe backend probing. The legacy Solutions FaceMesh API has been
+# progressively removed from recent mediapipe releases; the supported path
+# is the Tasks FaceLandmarker (needs models/face_landmarker.task, fetched by
+# scripts/download_models.sh). Probe at import, in order of preference:
+#   1. tasks FaceLandmarker  2. legacy FaceMesh  3. Haar cascades.
+import os as _os
+
+_MP = None
+_TASK_PATH = _os.path.join(_os.getenv("FACE_MODEL_DIR", "models"), "face_landmarker.task")
+_LANDMARKER_OPTS = None
+_LEGACY_OK = False
+LIVENESS_ENGINE = "cascades"
 try:
     import mediapipe as mp
-    _MP_AVAILABLE = True
-    LIVENESS_ENGINE = "mediapipe"
-except Exception:  # not installed / unsupported platform
-    _MP_AVAILABLE = False
-    LIVENESS_ENGINE = "cascades"
+    _MP = mp
+    try:
+        from mediapipe.tasks import python as _mp_python
+        from mediapipe.tasks.python import vision as _mp_vision
+        if _os.path.isfile(_TASK_PATH):
+            _LANDMARKER_OPTS = _mp_vision.FaceLandmarkerOptions(
+                base_options=_mp_python.BaseOptions(model_asset_path=_TASK_PATH),
+                running_mode=_mp_vision.RunningMode.IMAGE, num_faces=1,
+            )
+            # Construct once to validate, then discard.
+            _mp_vision.FaceLandmarker.create_from_options(_LANDMARKER_OPTS).close()
+            LIVENESS_ENGINE = "mediapipe_tasks"
+    except Exception:
+        _LANDMARKER_OPTS = None
+    if LIVENESS_ENGINE == "cascades":
+        try:
+            mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True, max_num_faces=1,
+                min_detection_confidence=0.5).close()
+            _LEGACY_OK = True
+            LIVENESS_ENGINE = "mediapipe"
+        except Exception:
+            pass
+except Exception:
+    _MP = None
+logger_probe = LIVENESS_ENGINE
 
 
 def _new_facemesh():
-    """
-    One FaceMesh per burst, in STATIC mode. This is deliberate and is the
-    fix for the head-turn failure: a shared instance in video/tracking mode
-    (a) is not thread-safe under concurrent requests, (b) leaks tracking
-    state between users' bursts, and (c) coasts on stale near-frontal
-    landmarks during fast head turns - reporting yaw ~ 0 with a face still
-    "present", which defeated both the yaw check and the face-loss
-    fallback. Static mode detects every frame independently.
-    """
-    return mp.solutions.face_mesh.FaceMesh(
+    """One legacy FaceMesh per burst, STATIC mode (see extraction notes)."""
+    return _MP.solutions.face_mesh.FaceMesh(
         static_image_mode=True, max_num_faces=1, refine_landmarks=False,
         min_detection_confidence=0.5,
     )
+
 
 # FaceMesh landmark indices (canonical face mesh topology).
 _L_EYE = (33, 160, 158, 133, 153, 144)   # p1..p6 for EAR
@@ -96,7 +122,7 @@ TURN_INVERTED = False
 
 
 def pick_challenges() -> list[str]:
-    pool = list(CHALLENGES) if LIVENESS_ENGINE == "mediapipe" else _CASCADE_CHALLENGES
+    pool = list(CHALLENGES) if LIVENESS_ENGINE.startswith("mediapipe") else _CASCADE_CHALLENGES
     return random.sample(pool, CHALLENGES_PER_SESSION)
 
 
@@ -127,6 +153,53 @@ def _ear(pts, idx) -> float:
     return float((v1 + v2) / (2.0 * h + 1e-6))
 
 
+def _features_from_points(pts, bgr, gray, prev_gray) -> FrameFeatures:
+    """Shared feature computation for both MediaPipe backends."""
+    f = FrameFeatures()
+    h, w = bgr.shape[:2]
+    xs, ys = pts[:, 0], pts[:, 1]
+    x0, y0 = int(max(0, xs.min())), int(max(0, ys.min()))
+    x1, y1 = int(min(w, xs.max())), int(min(h, ys.max()))
+    f.face = (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+    f.ear = (_ear(pts, _L_EYE) + _ear(pts, _R_EYE)) / 2.0
+    cheek_w = float(np.linalg.norm(pts[_CHEEK_R] - pts[_CHEEK_L])) + 1e-6
+    f.mouth_ratio = float(np.linalg.norm(pts[_MOUTH_R] - pts[_MOUTH_L])) / cheek_w
+    image_pts = np.array([pts[pose.POSE_LANDMARKS[k]] for k in (
+        "nose_tip", "chin", "right_eye_outer", "left_eye_outer",
+        "mouth_right", "mouth_left")], dtype=np.float64)
+    angles = pose.estimate_pose(image_pts, w, h)
+    if angles:
+        f.yaw, f.pitch = angles[0], angles[1]
+    if prev_gray is not None and prev_gray.shape == gray.shape:
+        diff = cv2.absdiff(gray[y0:y1, x0:x1], prev_gray[y0:y1, x0:x1])
+        f.motion = float(diff.mean()) if diff.size else 0.0
+    return f
+
+
+def _extract_tasks(frames: list[np.ndarray]) -> list[FrameFeatures]:
+    from mediapipe.tasks.python import vision as mp_vision
+    out: list[FrameFeatures] = []
+    prev_gray = None
+    landmarker = mp_vision.FaceLandmarker.create_from_options(_LANDMARKER_OPTS)
+    try:
+        for bgr in frames:
+            h, w = bgr.shape[:2]
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            mp_image = _MP.Image(image_format=_MP.ImageFormat.SRGB, data=rgb)
+            res = landmarker.detect(mp_image)
+            if res.face_landmarks:
+                pts = np.array([[lm.x * w, lm.y * h] for lm in res.face_landmarks[0]],
+                               dtype=np.float32)
+                out.append(_features_from_points(pts, bgr, gray, prev_gray))
+            else:
+                out.append(FrameFeatures())
+            prev_gray = gray
+    finally:
+        landmarker.close()
+    return out
+
+
 def _extract_mediapipe(frames: list[np.ndarray]) -> list[FrameFeatures]:
     out: list[FrameFeatures] = []
     prev_gray = None
@@ -140,29 +213,16 @@ def _extract_mediapipe(frames: list[np.ndarray]) -> list[FrameFeatures]:
                 pts = np.array(
                     [[lm.x * w, lm.y * h] for lm in res.multi_face_landmarks[0].landmark],
                     dtype=np.float32)
-                xs, ys = pts[:, 0], pts[:, 1]
-                x0, y0 = int(max(0, xs.min())), int(max(0, ys.min()))
-                x1, y1 = int(min(w, xs.max())), int(min(h, ys.max()))
-                f.face = (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
-                f.ear = (_ear(pts, _L_EYE) + _ear(pts, _R_EYE)) / 2.0
-                cheek_w = float(np.linalg.norm(pts[_CHEEK_R] - pts[_CHEEK_L])) + 1e-6
-                f.mouth_ratio = float(np.linalg.norm(pts[_MOUTH_R] - pts[_MOUTH_L])) / cheek_w
-                image_pts = np.array([pts[pose.POSE_LANDMARKS[k]] for k in (
-                    "nose_tip", "chin", "right_eye_outer", "left_eye_outer",
-                    "mouth_right", "mouth_left")], dtype=np.float64)
-                angles = pose.estimate_pose(image_pts, w, h)
-                if angles:
-                    f.yaw, f.pitch = angles[0], angles[1]
-                if prev_gray is not None and prev_gray.shape == gray.shape:
-                    diff = cv2.absdiff(gray[y0:y1, x0:x1], prev_gray[y0:y1, x0:x1])
-                    f.motion = float(diff.mean()) if diff.size else 0.0
+                f = _features_from_points(pts, bgr, gray, prev_gray)
             prev_gray = gray
             out.append(f)
     return out
 
 
 def extract_features(frames: list[np.ndarray]) -> list[FrameFeatures]:
-    if _FACEMESH is not None:
+    if LIVENESS_ENGINE == "mediapipe_tasks":
+        return _extract_tasks(frames)
+    if LIVENESS_ENGINE == "mediapipe":
         return _extract_mediapipe(frames)
     return _extract_cascades(frames)
 
@@ -343,7 +403,12 @@ def verify_challenge(challenge: str, frames: list[np.ndarray]) -> dict:
     if not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
         return {"passed": False, "reason": f"need {MIN_FRAMES}-{MAX_FRAMES} frames"}
 
-    feats = extract_features(frames)
+    try:
+        feats = extract_features(frames)
+    except Exception:
+        logger.exception("Feature extraction failed",
+                         extra={"data": {"challenge": challenge, "engine": LIVENESS_ENGINE}})
+        return {"passed": False, "reason": "processing_error", "engine": LIVENESS_ENGINE}
     presence = _face_presence(feats)
     motions = [f.motion for f in feats[1:] if f.face]
     motion_ok = bool(motions) and max(motions) > 1.0  # identical stills => ~0
